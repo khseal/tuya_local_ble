@@ -205,6 +205,10 @@ devices_database: dict[str, TuyaBLECategoryInfo] = {
             TuyaBLEProductInfo(
                 name="A1 PRO MAX",
             ),
+            "hc7n0urm":  # A1 Ultra-JM device product_id
+            TuyaBLEProductInfo(
+                name="A1 Ultra-JM",
+            ),
         },
     ),    
     "szjqr": TuyaBLECategoryInfo(
