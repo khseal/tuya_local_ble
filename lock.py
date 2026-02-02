@@ -83,7 +83,23 @@ mapping: dict[str, TuyaBLECategoryLockMapping] = {
                         key="manual_lock"
                     ),
                 ),
-            ]
+            ],
+            "hc7n0urm":  # A1 Ultra-JM Smart Lock
+            [
+                TuyaBLELockMapping(
+                    dp_id_unlock=6,
+                    dp_id_lock=46,
+                    dp_id=47,
+                    # refer to sdk, dp 52 is for deleting temp password
+                    # should be safe as a dummy keep alive message
+                    dp_id_nop=52,
+                    keep_connect=True,
+                    keep_connect_timer=60,
+                    description=LockEntityDescription(
+                        key="manual_lock"
+                    ),
+                ),
+            ],
         }
     ), 
 }
