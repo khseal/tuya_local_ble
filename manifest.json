@@ -4,12 +4,12 @@
   "bluetooth": [
     {
       "connectable": true,
-      "service_data_uuid": "0000a201-0000-1000-8000-00805f9b34fb"
+      "service_data_uuid": "0000fd50-0000-1000-8000-00805f9b34fb"
     }
   ],
   "codeowners": ["@SonSon"],
   "config_flow": true,
   "dependencies": ["bluetooth_adapters"],
   "iot_class": "local_push",
-  "version": "0.1"
+  "version": "0.11"
 }

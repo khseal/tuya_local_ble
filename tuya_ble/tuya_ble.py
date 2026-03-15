@@ -244,6 +244,8 @@ class TuyaBLEDevice:
         self._local_key: bytes | None = None
         self._login_key: bytes | None = None
         self._session_key: bytes | None = None
+        self._unlock_token: str = ""
+        self._hc7_unlock_prepared = False
 
         self._is_paired = False
 
@@ -302,6 +304,7 @@ class TuyaBLEDevice:
             if self._device_info:
                 self._local_key = self._device_info.local_key[:6].encode()
                 self._login_key = hashlib.md5(self._local_key).digest()
+                self._unlock_token = getattr(self._device_info, "unlock_token", "") or ""
 
         return self._device_info is not None
 
@@ -534,6 +537,7 @@ class TuyaBLEDevice:
             if client and client.is_connected:
                 await client.stop_notify(CHARACTERISTIC_NOTIFY)
                 await client.disconnect()
+        self._hc7_unlock_prepared = False
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
@@ -619,7 +623,7 @@ class TuyaBLEDevice:
                     try:
                         if not await self._send_packet_while_connected(
                             TuyaBLECode.FUN_SENDER_DEVICE_INFO,
-                            bytes(0),
+                            b"\x00\xf3",
                             0,
                             True,
                         ):
@@ -695,6 +699,67 @@ class TuyaBLEDevice:
             await asyncio.sleep(BLEAK_BACKOFF_TIME)
             _LOGGER.debug("%s: Reconnecting again", self.address)
             asyncio.create_task(self._reconnect())
+
+    def _next_hc7_op_id(self) -> int:
+        """Operation id used in vendor-specific 0x0027 payloads."""
+        return self._current_seq_num & 0xFF
+
+    async def _hc7_prepare_unlock(self) -> None:
+        """Send unlock prepare frame for hc7n0urm."""
+        if self._hc7_unlock_prepared:
+            return
+
+        if not self._unlock_token:
+            _LOGGER.error("%s: Missing unlock_token for hc7n0urm", self.address)
+            return
+
+        token = self._unlock_token.encode("ascii")
+        op_id = self._next_hc7_op_id()
+
+        # HCI-confirmed:
+        # 00000000014500000dffff0001313237343237363000
+        payload = bytearray(b"\x00\x00\x00\x00")
+        payload += pack(">B", op_id)
+        payload += bytes.fromhex("45 00 00 0d ff ff 00 01")
+        payload += token
+        payload += b"\x00"
+
+        _LOGGER.debug(
+            "%s: Sending hc7n0urm unlock prepare payload: %s",
+            self.address,
+            payload.hex(),
+        )
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, bytes(payload), True)
+        self._hc7_unlock_prepared = True
+
+    async def _hc7_unlock(self) -> None:
+        """Send unlock command for hc7n0urm."""
+        if not self._unlock_token:
+            _LOGGER.error("%s: Missing unlock_token for hc7n0urm", self.address)
+            return
+
+        await self._hc7_prepare_unlock()
+
+        token = self._unlock_token.encode("ascii")
+        op_id = self._next_hc7_op_id()
+        ts = int(time.time())
+
+        # HCI-confirmed shape:
+        # 000000000247000013ffff000131323734323736300169b6ba1f0001
+        payload = bytearray(b"\x00\x00\x00\x00")
+        payload += pack(">B", op_id)
+        payload += bytes.fromhex("47 00 00 13 ff ff 00 01")
+        payload += token
+        payload += b"\x01"
+        payload += pack(">I", ts)
+        payload += b"\x00\x01"
+
+        _LOGGER.debug(
+            "%s: Sending hc7n0urm unlock payload: %s",
+            self.address,
+            payload.hex(),
+        )
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, bytes(payload), True)
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -1053,6 +1118,61 @@ class TuyaBLEDevice:
             pos = next_pos
 
         self._fire_callbacks(datapoints)
+        return pos
+
+    def _parse_datapoints_v4(
+        self, timestamp: float, flags: int, data: bytes, start_pos: int
+    ) -> int:
+        datapoints: list[TuyaBLEDataPoint] = []
+        pos = start_pos
+
+        while len(data) - pos >= 4:
+            dp_id = data[pos]
+            pos += 1
+
+            _type = data[pos]
+            if _type > TuyaBLEDataPointType.DT_BITMAP.value:
+                break
+            type = TuyaBLEDataPointType(_type)
+            pos += 1
+
+            dp_flags = data[pos]
+            pos += 1
+
+            data_len = data[pos]
+            pos += 1
+
+            next_pos = pos + data_len
+            if next_pos > len(data):
+                raise TuyaBLEDataLengthError()
+
+            raw_value = data[pos:next_pos]
+
+            match type:
+                case TuyaBLEDataPointType.DT_RAW | TuyaBLEDataPointType.DT_BITMAP:
+                    value = raw_value
+                case TuyaBLEDataPointType.DT_BOOL:
+                    value = int.from_bytes(raw_value, "big") != 0
+                case TuyaBLEDataPointType.DT_VALUE | TuyaBLEDataPointType.DT_ENUM:
+                    value = int.from_bytes(raw_value, "big", signed=True)
+                case TuyaBLEDataPointType.DT_STRING:
+                    value = raw_value.decode()
+
+            _LOGGER.debug(
+                "%s: Received datapoint update, id: %s, type: %s, flags: %s, value: %s",
+                self.address,
+                dp_id,
+                type.name,
+                dp_flags,
+                value,
+            )
+
+            self._datapoints._update_from_device(dp_id, timestamp, dp_flags, type, value)
+            datapoints.append(self._datapoints[dp_id])
+            pos = next_pos
+
+        self._fire_callbacks(datapoints)
+        return pos
 
     def _handle_command_or_response(
         self, seq_num: int, response_to: int, code: TuyaBLECode, data: bytes
@@ -1093,6 +1213,49 @@ class TuyaBLEDevice:
                 if len(data) != 1:
                     raise TuyaBLEDataLengthError()
                 result = data[0]
+
+            case TuyaBLECode.FUN_SENDER_DPS_V4:
+                _LOGGER.debug(
+                    "%s: DPS_V4 response raw: %s",
+                    self.address,
+                    data.hex(),
+                )
+
+                pos = 0
+                cmd_status = 0
+
+                while len(data) - pos >= 5:
+                    dp_id = data[pos]
+                    pos += 1
+
+                    _type = data[pos]
+                    pos += 1
+
+                    value_len = int.from_bytes(data[pos:pos + 2], "big")
+                    pos += 2
+
+                    next_pos = pos + value_len
+                    if next_pos + 1 > len(data):
+                        raise TuyaBLEDataLengthError()
+
+                    raw_value = data[pos:next_pos]
+                    pos = next_pos
+
+                    cmd_status = data[pos]
+                    pos += 1
+
+                    _LOGGER.debug(
+                        "%s: DPS_V4 response dp_id=%s type=%s value=%s status=%s",
+                        self.address,
+                        dp_id,
+                        _type,
+                        raw_value.hex(),
+                        cmd_status,
+                    )
+
+                # For hc7n0urm, 0x0027 responses are vendor-specific ack frames.
+                # Do not treat cmd_status as generic Tuya error code.
+                result = 0 if self.product_id == "hc7n0urm" else cmd_status
 
             case TuyaBLECode.FUN_RECEIVE_TIME1_REQ:
                 if len(data) != 0:
@@ -1151,6 +1314,61 @@ class TuyaBLEDevice:
                 self._parse_datapoints_v3(time.time(), flags, data, pos)
                 data = pack(">HBB", dp_seq_num, flags, 0)
                 asyncio.create_task(self._send_response(code, data, seq_num))
+
+            case TuyaBLECode.FUN_RECEIVE_DP_V4:
+                _LOGGER.debug(
+                    "%s: Received DP_V4 raw: %s",
+                    self.address,
+                    data.hex(),
+                )
+
+                try:
+                    if self.product_id == "hc7n0urm" and len(data) == 12:
+                        # Short event packet seen from Raykube after command:
+                        # 000000002700002f01000100
+                        # tail = dp_id(1) type(1) len(2) value(1)
+                        tail = data[-5:]
+                        dp_id = tail[0]
+                        _type = tail[1]
+                        value_len = int.from_bytes(tail[2:4], "big")
+                        raw_value = tail[4:4 + value_len]
+
+                        if _type <= TuyaBLEDataPointType.DT_BITMAP.value and value_len == len(raw_value):
+                            dp_type = TuyaBLEDataPointType(_type)
+
+                            match dp_type:
+                                case TuyaBLEDataPointType.DT_RAW | TuyaBLEDataPointType.DT_BITMAP:
+                                    value = raw_value
+                                case TuyaBLEDataPointType.DT_BOOL:
+                                    value = int.from_bytes(raw_value, "big") != 0
+                                case TuyaBLEDataPointType.DT_VALUE | TuyaBLEDataPointType.DT_ENUM:
+                                    value = int.from_bytes(raw_value, "big", signed=True)
+                                case TuyaBLEDataPointType.DT_STRING:
+                                    value = raw_value.decode()
+
+                            _LOGGER.debug(
+                                "%s: Received short DP_V4 update, id: %s, type: %s, value: %s",
+                                self.address,
+                                dp_id,
+                                dp_type.name,
+                                value,
+                            )
+
+                            self._datapoints._update_from_device(
+                                dp_id, time.time(), 0, dp_type, value
+                            )
+                            self._fire_callbacks([self._datapoints[dp_id]])
+                        else:
+                            self._parse_datapoints_v4(time.time(), 0, data, 8)
+                    else:
+                        self._parse_datapoints_v4(time.time(), 0, data, 8)
+                except Exception:
+                    _LOGGER.exception("%s: DP_V4 parse failed", self.address)
+
+                asyncio.create_task(
+                    self._send_response(code, bytes(0), seq_num)
+                )
+
 
         if response_to != 0:
             future = self._input_expected_responses.pop(response_to, None)
@@ -1282,28 +1500,76 @@ class TuyaBLEDevice:
         elif len(self._input_buffer) == self._input_expected_length:
             self._parse_input()
 
-    async def _send_datapoints_v3(self, datapoint_ids: list[int]) -> None:
-        """Send new values of datapoints to the device."""
-        data = bytearray()
-        for dp_id in datapoint_ids:
-            dp = self._datapoints[dp_id]
-            value = dp._get_value()
-            _LOGGER.debug(
-                "%s: Sending datapoint update, id: %s, type: %s: value: %s",
+    async def _send_datapoints_v4(self, datapoint_ids: list[int]) -> None:
+        """Send new values of datapoints to the device using V4 command 0x0027."""
+
+        if len(datapoint_ids) != 1:
+            _LOGGER.error("%s: hc7n0urm expects single-DP V4 command", self.address)
+            return
+
+        dp_id = datapoint_ids[0]
+        dp = self._datapoints[dp_id]
+        value = dp._get_value()
+
+        _LOGGER.debug(
+            "%s: Sending V4 datapoint update, id: %s, type: %s: value: %s",
+            self.address,
+            dp.id,
+            dp.type.name,
+            dp.value,
+        )
+
+        # HCI-confirmed lock command:
+        # 00000000032e01000101
+        if dp.id == 46 and dp.type == TuyaBLEDataPointType.DT_BOOL and value == b"\x01":
+            data = bytearray(b"\x00\x00\x00\x00\x03")
+            data += pack(">BBH", dp.id, int(dp.type.value), len(value))
+            data += value
+        else:
+            _LOGGER.error(
+                "%s: Unsupported hc7n0urm V4 command dp_id=%s type=%s value=%s",
                 self.address,
                 dp.id,
                 dp.type.name,
-                dp.value,
+                value.hex(),
             )
-            data += pack(">BBB", dp.id, int(dp.type.value), len(value))
-            data += value
+            return
 
-        #await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data)
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS, data, False)
-
+        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data, True)
+        
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
-        if self._protocol_version == 3:
-            await self._send_datapoints_v3(datapoint_ids)
-        else:
-            raise TuyaBLEDeviceError(0)
+        if self.product_id == "hc7n0urm":
+            if len(datapoint_ids) != 1:
+                _LOGGER.error("%s: hc7n0urm expects single datapoint command", self.address)
+                return
+
+            dp_id = datapoint_ids[0]
+            dp = self._datapoints[dp_id]
+
+            # lock path
+            if dp_id == 46 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
+                await self._send_datapoints_v4(datapoint_ids)
+                return
+
+            # unlock path
+            if dp_id == 6 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
+                await self._hc7_unlock()
+                return
+
+            _LOGGER.error(
+                "%s: Unsupported hc7n0urm V4 command dp_id=%s type=%s value=%s",
+                self.address,
+                dp_id,
+                dp.type.name,
+                dp._get_value().hex(),
+            )
+            return
+
+        _LOGGER.error(
+            "%s: Cannot send datapoints, unsupported protocol_version=%s",
+            self.address,
+            self._protocol_version,
+        )
+        return
+
