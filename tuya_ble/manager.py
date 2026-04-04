@@ -14,6 +14,7 @@ class TuyaBLEDeviceCredentials:
     device_name: str | None
     product_model: str | None
     product_name: str | None
+    unlock_token: str = ""
 
     def __str__(self):
         return (

@@ -28,13 +28,11 @@ TuyaBLELockIsAvailable = Callable[["TuyaBLELock", TuyaBLEProductInfo], bool] | N
 
 from typing import Any
 
-from homeassistant.const import (
-    STATE_LOCKED,
-    STATE_UNKNOWN,
-    STATE_UNLOCKED,
-    STATE_LOCKING,
-    STATE_UNLOCKING,
-)
+STATE_LOCKED = "locked"
+STATE_UNLOCKED = "unlocked"
+STATE_LOCKING = "locking"
+STATE_UNLOCKING = "unlocking"
+STATE_UNKNOWN = "unknown"
 
 @dataclass
 class TuyaBLELockMapping:
@@ -93,7 +91,7 @@ mapping: dict[str, TuyaBLECategoryLockMapping] = {
                     # refer to sdk, dp 52 is for deleting temp password
                     # should be safe as a dummy keep alive message
                     dp_id_nop=52,
-                    keep_connect=True,
+                    keep_connect=False,
                     keep_connect_timer=60,
                     description=LockEntityDescription(
                         key="manual_lock"

@@ -74,6 +74,7 @@ class HASSTuyaBLEDeviceManager(AbstaractTuyaBLEDeviceManager):
                 credentials.get(CONF_DEVICE_NAME, ""),
                 credentials.get(CONF_PRODUCT_MODEL, ""),
                 credentials.get(CONF_PRODUCT_NAME, ""),
+                credentials.get("unlock_token", ""),
             )
             _LOGGER.debug("Retrieved: %s", result)
 
