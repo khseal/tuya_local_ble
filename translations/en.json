@@ -1,8 +1,9 @@
 {
     "config": {
-      "abort": {
+    "abort": {
+        "invalid_json": "Invalid JSON in tuya_local_ble/devices.json. Fix the syntax error (see Home Assistant log for line/column).",
         "no_unconfigured_devices": "No unconfigured devices found."
-      },
+    },
       "error": {
         "device_not_registered": "Device is not registered, please check config."
       },

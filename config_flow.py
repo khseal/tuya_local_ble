@@ -7,10 +7,12 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant.config_entries import (
-    ConfigFlow,
-    ConfigFlowResult    
-)
+from homeassistant.config_entries import ConfigFlow
+
+try:
+    from homeassistant.config_entries import ConfigFlowResult
+except ImportError:
+    from homeassistant.data_entry_flow import FlowResult as ConfigFlowResult
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
@@ -43,6 +45,21 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
         self._manager: HASSTuyaBLEDeviceManager | None = None
         self._get_device_info_error = False
 
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Handle a flow started from the UI (Add integration).
+
+        Without this step, HA shows ``not_implemented`` — only ``async_step_bluetooth``
+        existed before.
+        """
+        if self._manager is None:
+            self._manager = HASSTuyaBLEDeviceManager(self.hass, self._data)
+        await self._manager.async_load_devices_file()
+        if self._manager.load_error == "invalid_json":
+            return self.async_abort(reason="invalid_json")
+        return await self.async_step_device(user_input)
+
     async def async_step_bluetooth(
         self, discovery_info: BluetoothServiceInfoBleak
     ) -> ConfigFlowResult:
@@ -52,6 +69,9 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovery_info = discovery_info
         if self._manager is None:
             self._manager = HASSTuyaBLEDeviceManager(self.hass, self._data)
+        await self._manager.async_load_devices_file()
+        if self._manager.load_error == "invalid_json":
+            return self.async_abort(reason="invalid_json")
         #await self._manager.build_cache()
         self.context["title_placeholders"] = {
             "name": await get_device_readable_name(
@@ -65,6 +85,12 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Handle the user step to pick discovered device."""
+        if self._manager is None:
+            self._manager = HASSTuyaBLEDeviceManager(self.hass, self._data)
+        await self._manager.async_load_devices_file()
+        if self._manager.load_error == "invalid_json":
+            return self.async_abort(reason="invalid_json")
+
         errors: dict[str, str] = {}
 
         if user_input is not None:

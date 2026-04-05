@@ -9,7 +9,10 @@
   ],
   "codeowners": ["@SonSon"],
   "config_flow": true,
-  "dependencies": ["bluetooth_adapters"],
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/khseal/tuya_local_ble",
+  "integration_type": "device",
   "iot_class": "local_push",
-  "version": "0.11"
+  "issue_tracker": "https://github.com/khseal/tuya_local_ble/issues",
+  "version": "0.14"
 }

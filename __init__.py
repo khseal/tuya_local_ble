@@ -43,6 +43,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             f"Could not find Tuya BLE device with address {address}"
         )
     manager = HASSTuyaBLEDeviceManager(hass, entry.options.copy())
+    await manager.async_load_devices_file()
+    if manager.load_error == "invalid_json":
+        raise ConfigEntryNotReady(
+            "Invalid JSON in tuya_local_ble/devices.json — check the file for a "
+            "syntax error (line/column is logged)."
+        )
     device = TuyaBLEDevice(manager, ble_device)
     await device.initialize()
     product_info = get_device_product_info(device)

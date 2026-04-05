@@ -6,16 +6,15 @@ from dataclasses import dataclass, field
 import logging
 from typing import Callable
 from datetime import datetime, timedelta
-from threading import Timer
-import time
 
 from homeassistant.components.lock import (
     LockEntityDescription,
     LockEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import DOMAIN
@@ -55,7 +54,7 @@ class TuyaBLELockMapping(TuyaBLELockMapping):
             translation_key="push",
         )
     )
-    is_available: TuyaBLELockIsAvailable = 0
+    is_available: TuyaBLELockIsAvailable = None
 
 @dataclass
 class TuyaBLECategoryLockMapping:
@@ -136,21 +135,36 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         self._commanded_timer = None
         self._datapoint_nop = None
         self._isjammed = False
+        self._remove_keepalive: CALLBACK_TYPE | None = None
         self._update_attrs()
-        if mapping.keep_connect:
-            self._thread = Timer(self._mapping.keep_connect_timer, self.send_nop_request)
-            self._thread.start()
-            self._datapoint_nop = device.datapoints.get_or_create(
-                self._mapping.dp_id_nop,
-                TuyaBLEDataPointType.DT_BOOL,
-                False,
-            )
 
-    def send_nop_request(self):
-        while True:
-            if self._datapoint_nop:
-                self._hass.create_task(self._datapoint_nop.set_value(True))
-            time.sleep(self._mapping.keep_connect_timer)
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        if not self._mapping.keep_connect:
+            return
+        self._datapoint_nop = self._device.datapoints.get_or_create(
+            self._mapping.dp_id_nop,
+            TuyaBLEDataPointType.DT_BOOL,
+            False,
+        )
+        self._remove_keepalive = async_track_time_interval(
+            self.hass,
+            self._async_keepalive,
+            timedelta(seconds=self._mapping.keep_connect_timer),
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._remove_keepalive is not None:
+            self._remove_keepalive()
+            self._remove_keepalive = None
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _async_keepalive(self, _now: datetime) -> None:
+        """Periodic BLE keepalive (Gimdow only; hc7n0urm has keep_connect=False)."""
+        if not self._coordinator.connected or self._datapoint_nop is None:
+            return
+        self.hass.async_create_task(self._datapoint_nop.set_value(True))
 
     @property
     def is_locked(self) -> bool | None:
