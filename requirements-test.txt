@@ -1,3 +1,0 @@
-# Зависимости для test_lock_diagnostic.py
-bleak>=0.21.0
-pycryptodome>=3.19.0

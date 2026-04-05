@@ -14,5 +14,5 @@
   "integration_type": "device",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/khseal/tuya_local_ble/issues",
-  "version": "0.14"
+  "version": "0.15"
 }
