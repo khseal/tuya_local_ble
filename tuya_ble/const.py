@@ -15,6 +15,10 @@ MANUFACTURER_DATA_ID = 0x07D0
 
 RESPONSE_WAIT_TIMEOUT = 60
 
+# Startup handshake (device info + pair): shorter wait so HA bootstrap is not blocked
+# for a full minute, and stale sessions fail faster when the radio is flaky.
+HANDSHAKE_RESPONSE_TIMEOUT = 25
+
 
 class TuyaBLECode(Enum):
     FUN_SENDER_DEVICE_INFO = 0x0000

@@ -1,6 +1,7 @@
 """The Tuya BLE integration."""
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS, get_device
@@ -50,29 +51,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "syntax error (line/column is logged)."
         )
     device = TuyaBLEDevice(manager, ble_device)
-    await device.initialize()
-    product_info = get_device_product_info(device)
 
-    coordinator = TuyaBLECoordinator(hass, device)
-
-    '''
-    try:
-        await device.update()
-    except BLEAK_EXCEPTIONS as ex:
-        raise ConfigEntryNotReady(
-            f"Could not communicate with Tuya BLE device with address {address}"
-        ) from ex
-    '''
-    #hass.async_create_task(device.update())
-
-    await device.update()
-    
     @callback
     def _async_update_ble(
         service_info: bluetooth.BluetoothServiceInfoBleak,
         change: bluetooth.BluetoothChange,
     ) -> None:
-        """Update from a ble callback."""
+        """Keep BLEDevice and advertisement in sync (protocol version, RSSI)."""
         device.set_ble_device_and_advertisement_data(
             service_info.device, service_info.advertisement
         )
@@ -86,6 +71,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
     )
 
+    await device.initialize()
+    product_info = get_device_product_info(device)
+
+    coordinator = TuyaBLECoordinator(hass, device)
+
+    '''
+    try:
+        await device.update()
+    except BLEAK_EXCEPTIONS as ex:
+        raise ConfigEntryNotReady(
+            f"Could not communicate with Tuya BLE device with address {address}"
+        ) from ex
+    '''
+
+    def _log_update_err(task: asyncio.Task) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _LOGGER.debug("%s: initial device.update() failed", address, exc_info=True)
+
+    t = hass.async_create_task(device.update())
+    t.add_done_callback(_log_update_err)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = TuyaBLEData(
         entry.title,
         device,

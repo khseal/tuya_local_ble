@@ -25,6 +25,7 @@ from .const import (
     CHARACTERISTIC_NOTIFY,
     CHARACTERISTIC_WRITE,
     GATT_MTU,
+    HANDSHAKE_RESPONSE_TIMEOUT,
     MANUFACTURER_DATA_ID,
     RESPONSE_WAIT_TIMEOUT,
     SERVICE_UUID,
@@ -44,6 +45,11 @@ _LOGGER = logging.getLogger(__name__)
 
 
 BLEAK_EXCEPTIONS = (*BLEAK_RETRY_EXCEPTIONS, OSError)
+
+HC7_PRODUCT_ID = "hc7n0urm"
+HC7_CONNECT_ATTEMPTS = 8
+HC7_NOTIFY_SETTLE_DELAY = 0.35
+HC7_NOTIFY_RETRY_DELAY = 0.8
 
 
 class TuyaBLEDataPoint:
@@ -237,8 +243,6 @@ class TuyaBLEDevice:
         self._device_version: str = ""
         self._protocol_version_str: str = ""
         self._hardware_version: str = ""
-
-        self._device_info: TuyaBLEDeviceCredentials | None = None
 
         self._auth_key: bytes | None = None
         self._local_key: bytes | None = None
@@ -541,6 +545,104 @@ class TuyaBLEDevice:
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
+    async def _cleanup_failed_connection(
+        self, client: BleakClientWithServiceCache | None
+    ) -> None:
+        """Close a failed BLE session without scheduling a reconnect task."""
+        if self._client is client:
+            self._client = None
+        if client is None:
+            return
+        expected_disconnect = self._expected_disconnect
+        self._expected_disconnect = True
+        try:
+            if client.is_connected:
+                await client.disconnect()
+        except BLEAK_EXCEPTIONS:
+            _LOGGER.debug("%s: cleanup disconnect failed", self.address, exc_info=True)
+        except Exception:
+            _LOGGER.debug("%s: cleanup disconnect failed", self.address, exc_info=True)
+        finally:
+            self._expected_disconnect = expected_disconnect
+
+    async def _start_notify_with_retry(
+        self, client: BleakClientWithServiceCache
+    ) -> bool:
+        """Start notifications, giving slow battery locks a settle delay."""
+        if self.product_id == HC7_PRODUCT_ID:
+            await asyncio.sleep(HC7_NOTIFY_SETTLE_DELAY)
+        try:
+            await client.start_notify(
+                CHARACTERISTIC_NOTIFY, self._notification_handler
+            )
+            return True
+        except BleakDBusError as err:
+            # BlueZ: notify already enabled (race). Old callback may be stale:
+            # stop and subscribe again so notifications reach this handler.
+            err_s = str(err).lower()
+            if (
+                ("notpermitted" in err_s and "acquired" in err_s)
+                or "notify acquired" in err_s
+            ):
+                _LOGGER.debug(
+                    "%s: notify busy; re-subscribing RSSI: %s",
+                    self.address,
+                    self.rssi,
+                )
+                try:
+                    await client.stop_notify(CHARACTERISTIC_NOTIFY)
+                    await asyncio.sleep(0.2)
+                except (BleakDBusError, BleakError, OSError):
+                    pass
+                try:
+                    await client.start_notify(
+                        CHARACTERISTIC_NOTIFY,
+                        self._notification_handler,
+                    )
+                    return True
+                except BleakDBusError as err_re:
+                    err_re_s = str(err_re).lower()
+                    if (
+                        ("notpermitted" in err_re_s and "acquired" in err_re_s)
+                        or "notify acquired" in err_re_s
+                    ):
+                        _LOGGER.debug(
+                            "%s: notify still acquired after stop; RSSI: %s",
+                            self.address,
+                            self.rssi,
+                        )
+                        return True
+                    _LOGGER.debug(
+                        "%s: notify re-subscribe failed",
+                        self.address,
+                        exc_info=True,
+                    )
+                except Exception:
+                    _LOGGER.debug(
+                        "%s: notify re-subscribe failed",
+                        self.address,
+                        exc_info=True,
+                    )
+            else:
+                _LOGGER.debug(
+                    "%s: start_notify failed",
+                    self.address,
+                    exc_info=True,
+                )
+        except BLEAK_EXCEPTIONS:
+            _LOGGER.debug(
+                "%s: start_notify failed",
+                self.address,
+                exc_info=True,
+            )
+        except Exception:
+            _LOGGER.debug(
+                "%s: start_notify failed",
+                self.address,
+                exc_info=True,
+            )
+        return False
+
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
         global global_connect_lock
@@ -560,9 +662,13 @@ class TuyaBLEDevice:
             await asyncio.sleep(0.01)
             if self._client and self._client.is_connected and self._is_paired:
                 return
-            attempts_count = 100
+            attempts_count = (
+                HC7_CONNECT_ATTEMPTS if self.product_id == HC7_PRODUCT_ID else 100
+            )
             while attempts_count > 0:
                 attempts_count -= 1
+                async with self._seq_num_lock:
+                    self._current_seq_num = 1
                 if attempts_count == 0:
                     _LOGGER.error(
                         "%s: Connecting, all attempts failed; RSSI: %s",
@@ -605,17 +711,30 @@ class TuyaBLEDevice:
                     _LOGGER.debug("%s: Connected; RSSI: %s",
                                   self.address, self.rssi)
                     self._client = client
-                    try:
-                        await self._client.start_notify(
-                            CHARACTERISTIC_NOTIFY, self._notification_handler
+                    # New BLE session: must start at seq 1 and clear GATT reassembly,
+                    # or the lock may ignore the first command after a failed attempt.
+                    async with self._seq_num_lock:
+                        self._current_seq_num = 1
+                    self._clean_input()
+                    if not await self._start_notify_with_retry(client):
+                        _LOGGER.error(
+                            "%s: starting notifications failed", self.address
                         )
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
-                        _LOGGER.error("%s: starting notifications failed",
-                                      self.address, exc_info=True)
+                        await self._cleanup_failed_connection(client)
+                        if self.product_id == HC7_PRODUCT_ID:
+                            await asyncio.sleep(HC7_NOTIFY_RETRY_DELAY)
                         continue
                 else:
                     continue
+
+                if self._advertisement_data:
+                    self._decode_advertisement_data()
+
+                # Raykube A1 Ultra (hc7) uses protocol v4 on FD50 BLE; advertise it in the
+                # first GATT fragments. Without this, firmware may ignore device info / reply.
+                if self.product_id == HC7_PRODUCT_ID:
+                    self._protocol_version = max(self._protocol_version, 4)
+                    await asyncio.sleep(0.35)
 
                 if self._client and self._client.is_connected:
                     _LOGGER.debug(
@@ -626,6 +745,7 @@ class TuyaBLEDevice:
                             b"\x00\xf3",
                             0,
                             True,
+                            HANDSHAKE_RESPONSE_TIMEOUT,
                         ):
                             self._client = None
                             _LOGGER.error(
@@ -649,6 +769,7 @@ class TuyaBLEDevice:
                             self._build_pairing_request(),
                             0,
                             True,
+                            HANDSHAKE_RESPONSE_TIMEOUT,
                         ):
                             self._client = None
                             _LOGGER.error(
@@ -867,6 +988,7 @@ class TuyaBLEDevice:
         code: TuyaBLECode,
         data: bytes,
         wait_for_response: bool = True,
+        response_timeout: float | None = None,
         # retry: int | None = None,
     ) -> None:
         """Send packet to device and optional read response."""
@@ -875,7 +997,9 @@ class TuyaBLEDevice:
         await self._ensure_connected()
         if self._expected_disconnect:
             return
-        await self._send_packet_while_connected(code, data, 0, wait_for_response)
+        await self._send_packet_while_connected(
+            code, data, 0, wait_for_response, response_timeout
+        )
 
     async def _send_response(
         self,
@@ -893,6 +1017,7 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
         wait_for_response: bool,
+        response_timeout: float | None = None,
         # retry: int | None = None
     ) -> bool:
         """Send packet to device and optional read response."""
@@ -921,9 +1046,15 @@ class TuyaBLEDevice:
         packets: list[bytes] = self._build_packets(
             seq_num, code, data, response_to)
         await self._int_send_packet_while_connected(packets)
+        timeout_sec = (
+            RESPONSE_WAIT_TIMEOUT if response_timeout is None else response_timeout
+        )
         if future:
             try:
-                await asyncio.wait_for(future, RESPONSE_WAIT_TIMEOUT)
+                await asyncio.wait_for(future, timeout_sec)
+            except asyncio.CancelledError:
+                self._input_expected_responses.pop(seq_num, None)
+                raise
             except asyncio.TimeoutError:
                 _LOGGER.error(
                     "%s: timeout receiving response, RSSI: %s",
@@ -1396,6 +1527,14 @@ class TuyaBLEDevice:
         encrypted = self._input_buffer[17:]
 
         self._clean_input()
+
+        if key is None:
+            _LOGGER.error(
+                "%s: Unknown security flag %s in notify payload; cannot decrypt",
+                self.address,
+                security_flag,
+            )
+            return
 
         cipher = AES.new(key, AES.MODE_CBC, iv)
         raw = cipher.decrypt(encrypted)
