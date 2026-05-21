@@ -50,6 +50,9 @@ HC7_PRODUCT_ID = "hc7n0urm"
 HC7_CONNECT_ATTEMPTS = 8
 HC7_NOTIFY_SETTLE_DELAY = 0.35
 HC7_NOTIFY_RETRY_DELAY = 0.8
+# Lock/unlock physically completes in ~3 s; do not block HA service call for the
+# generic 60 s while the future hangs (short DP_V4 events do not close it).
+HC7_COMMAND_RESPONSE_TIMEOUT = 10
 
 
 class TuyaBLEDataPoint:
@@ -250,6 +253,10 @@ class TuyaBLEDevice:
         self._session_key: bytes | None = None
         self._unlock_token: str = ""
         self._hc7_unlock_prepared = False
+        # Single-flight optimistic-state-reflection task for hc7n0urm: some
+        # firmware revisions ack the V4 lock/unlock command but never push a
+        # follow-up DP 47 update, leaving HA stuck in "unlocking…".
+        self._hc7_reflect_task: asyncio.Task | None = None
 
         self._is_paired = False
 
@@ -498,6 +505,10 @@ class TuyaBLEDevice:
         """Disconnected callback."""
         was_paired = self._is_paired
         self._is_paired = False
+        # Vendor-specific unlock prepare state is bound to the BLE session.
+        # On the next session the lock has no memory of "prepared", so the next
+        # unlock must re-send the prepare frame.
+        self._hc7_unlock_prepared = False
         self._fire_disconnected_callbacks()
         if self._expected_disconnect:
             _LOGGER.debug(
@@ -534,6 +545,8 @@ class TuyaBLEDevice:
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
+        if self._hc7_reflect_task is not None and not self._hc7_reflect_task.done():
+            self._hc7_reflect_task.cancel()
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
@@ -850,7 +863,12 @@ class TuyaBLEDevice:
             self.address,
             payload.hex(),
         )
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, bytes(payload), True)
+        await self._send_packet(
+            TuyaBLECode.FUN_SENDER_DPS_V4,
+            bytes(payload),
+            True,
+            HC7_COMMAND_RESPONSE_TIMEOUT,
+        )
         self._hc7_unlock_prepared = True
 
     async def _hc7_unlock(self) -> None:
@@ -880,7 +898,75 @@ class TuyaBLEDevice:
             self.address,
             payload.hex(),
         )
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, bytes(payload), True)
+        await self._send_packet(
+            TuyaBLECode.FUN_SENDER_DPS_V4,
+            bytes(payload),
+            True,
+            HC7_COMMAND_RESPONSE_TIMEOUT,
+        )
+
+    def _hc7_schedule_state_reflection(
+        self, unlocked: bool, reflect_since: float | None = None,
+    ) -> None:
+        """Cancel any pending reflection and arm a fresh one.
+
+        Some hc7n0urm firmware revisions only ack the V4 lock/unlock command
+        and never push the matching DP 47 update afterwards. Without a
+        fallback, HA stays in "locking/unlocking…" until the watchdog clears
+        it as jammed. This task waits a short grace window for a real DP
+        push and, if none arrives, synthesises a DP 47 update reflecting the
+        target state so the entity can settle.
+
+        reflect_since:
+            Wall time *before* the GATT command is sent. DP 47 may arrive
+            before this helper is scheduled (while awaiting _send_*). If we
+            only compared timestamps from "now" at schedule time, we would
+            false-negative and log a spurious warning even though the device
+            had already pushed bolt state.
+        """
+        if reflect_since is None:
+            reflect_since = time.time()
+        prev = self._hc7_reflect_task
+        if prev is not None and not prev.done():
+            prev.cancel()
+        self._hc7_reflect_task = asyncio.create_task(
+            self._hc7_reflect_state(unlocked, reflect_since)
+        )
+
+    async def _hc7_reflect_state(
+        self, unlocked: bool, reflect_since: float,
+    ) -> None:
+        # Wait long enough to absorb the genuine DP 47 push the firmware sends
+        # after a LOCK command (~3.5 s in btsnoop captures of A1 Ultra-JM).
+        # 5 s gives the firmware comfortable margin without making the UI feel
+        # frozen if it never pushes (UNLOCK case).
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            return
+
+        dp47 = self._datapoints[47]
+        if dp47 is not None and isinstance(dp47.value, bool):
+            # Strongest signal: bolt state already matches (also fixes the
+            # race where DP 47 arrives before reflect_since is recorded).
+            if dp47.value == unlocked:
+                return
+        if dp47 is not None and dp47.timestamp >= reflect_since:
+            # New push since we started this command — trust it even if value
+            # parsing surprised us (unlikely).
+            return
+
+        # hc7n0urm: unlock usually does not push DP 47; lock normally does
+        # but we still synthesise when neither value nor timestamp caught it.
+        _LOGGER.debug(
+            "%s: synthesising DP 47=%s (no matching push after command)",
+            self.address,
+            "unlocked" if unlocked else "locked",
+        )
+        self._datapoints._update_from_device(
+            47, time.time(), 0, TuyaBLEDataPointType.DT_BOOL, unlocked,
+        )
+        self._fire_callbacks([self._datapoints[47]])
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -1118,7 +1204,13 @@ class TuyaBLEDevice:
                 BLEAK_BACKOFF_TIME,
                 ex,
             )
-            if self._is_paired:
+            # hc7n0urm V4 commands carry a UNIX timestamp / op_id; resending the
+            # exact same payload after a transport error can replay a stale
+            # command and trigger an audible ack on the lock without performing
+            # the operation. Surface the error and let HA retry instead.
+            if self.product_id == HC7_PRODUCT_ID:
+                asyncio.create_task(self._reconnect())
+            elif self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
@@ -1131,7 +1223,9 @@ class TuyaBLEDevice:
                 self.rssi,
                 ex,
             )
-            if self._is_paired:
+            if self.product_id == HC7_PRODUCT_ID:
+                asyncio.create_task(self._reconnect())
+            elif self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
                 asyncio.create_task(self._reconnect())
@@ -1454,43 +1548,63 @@ class TuyaBLEDevice:
                 )
 
                 try:
-                    if self.product_id == "hc7n0urm" and len(data) == 12:
-                        # Short event packet seen from Raykube after command:
-                        # 000000002700002f01000100
-                        # tail = dp_id(1) type(1) len(2) value(1)
-                        tail = data[-5:]
-                        dp_id = tail[0]
-                        _type = tail[1]
-                        value_len = int.from_bytes(tail[2:4], "big")
-                        raw_value = tail[4:4 + value_len]
+                    if self.product_id == "hc7n0urm":
+                        # hc7n0urm layout (btsnoop):
+                        #   bytes 0..3 padding
+                        #   byte 4    seq/op
+                        #   byte 5    often 0x00 even for real DP pushes (manual
+                        #             lock/unlock notifications use 12-byte frames
+                        #             with [5]==0x00 — must not treat as "echo").
+                        #   byte 6    reserved (0x00)
+                        #   byte 7..  V4 DP triplets for multi-DP reports ([5]==0x01)
+                        #
+                        # Long frames with [5]==0x00 are vendor command echoes
+                        # (unlock blob etc.) — no bolt DP there.
+                        if len(data) == 12:
+                            # Single DP: tail = id(1) type(1) len(2) value(len)
+                            # e.g. manual state 000000004600002f01000101 -> dp 47 bool 1
+                            tail = data[-5:]
+                            dp_id = tail[0]
+                            _type = tail[1]
+                            value_len = int.from_bytes(tail[2:4], "big")
+                            raw_value = tail[4:4 + value_len]
 
-                        if _type <= TuyaBLEDataPointType.DT_BITMAP.value and value_len == len(raw_value):
-                            dp_type = TuyaBLEDataPointType(_type)
+                            if _type <= TuyaBLEDataPointType.DT_BITMAP.value and value_len == len(raw_value):
+                                dp_type = TuyaBLEDataPointType(_type)
 
-                            match dp_type:
-                                case TuyaBLEDataPointType.DT_RAW | TuyaBLEDataPointType.DT_BITMAP:
-                                    value = raw_value
-                                case TuyaBLEDataPointType.DT_BOOL:
-                                    value = int.from_bytes(raw_value, "big") != 0
-                                case TuyaBLEDataPointType.DT_VALUE | TuyaBLEDataPointType.DT_ENUM:
-                                    value = int.from_bytes(raw_value, "big", signed=True)
-                                case TuyaBLEDataPointType.DT_STRING:
-                                    value = raw_value.decode()
+                                match dp_type:
+                                    case TuyaBLEDataPointType.DT_RAW | TuyaBLEDataPointType.DT_BITMAP:
+                                        value = raw_value
+                                    case TuyaBLEDataPointType.DT_BOOL:
+                                        value = int.from_bytes(raw_value, "big") != 0
+                                    case TuyaBLEDataPointType.DT_VALUE | TuyaBLEDataPointType.DT_ENUM:
+                                        value = int.from_bytes(raw_value, "big", signed=True)
+                                    case TuyaBLEDataPointType.DT_STRING:
+                                        value = raw_value.decode()
 
+                                _LOGGER.debug(
+                                    "%s: Received short DP_V4 update, id: %s, type: %s, value: %s",
+                                    self.address,
+                                    dp_id,
+                                    dp_type.name,
+                                    value,
+                                )
+
+                                self._datapoints._update_from_device(
+                                    dp_id, time.time(), 0, dp_type, value
+                                )
+                                self._fire_callbacks([self._datapoints[dp_id]])
+                            else:
+                                self._parse_datapoints_v4(time.time(), 0, data, 7)
+                        elif len(data) >= 6 and data[5] == 0x00:
                             _LOGGER.debug(
-                                "%s: Received short DP_V4 update, id: %s, type: %s, value: %s",
+                                "%s: Ignoring DP_V4 vendor echo (%s B): %s",
                                 self.address,
-                                dp_id,
-                                dp_type.name,
-                                value,
+                                len(data),
+                                data.hex(),
                             )
-
-                            self._datapoints._update_from_device(
-                                dp_id, time.time(), 0, dp_type, value
-                            )
-                            self._fire_callbacks([self._datapoints[dp_id]])
                         else:
-                            self._parse_datapoints_v4(time.time(), 0, data, 8)
+                            self._parse_datapoints_v4(time.time(), 0, data, 7)
                     else:
                         self._parse_datapoints_v4(time.time(), 0, data, 8)
                 except Exception:
@@ -1674,8 +1788,13 @@ class TuyaBLEDevice:
             )
             return
 
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DPS_V4, data, True)
-        
+        await self._send_packet(
+            TuyaBLECode.FUN_SENDER_DPS_V4,
+            data,
+            True,
+            HC7_COMMAND_RESPONSE_TIMEOUT,
+        )
+
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
         if self.product_id == "hc7n0urm":
@@ -1688,12 +1807,17 @@ class TuyaBLEDevice:
 
             # lock path
             if dp_id == 46 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
+                reflect_since = time.time()
                 await self._send_datapoints_v4(datapoint_ids)
+                # If the device acks but does not push DP 47, synthesise it.
+                self._hc7_schedule_state_reflection(False, reflect_since)
                 return
 
             # unlock path
             if dp_id == 6 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
+                reflect_since = time.time()
                 await self._hc7_unlock()
+                self._hc7_schedule_state_reflection(True, reflect_since)
                 return
 
             _LOGGER.error(

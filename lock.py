@@ -13,11 +13,12 @@ from homeassistant.components.lock import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
+from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import DOMAIN, SERVICE_FORCE_LOCK, SERVICE_FORCE_UNLOCK
 from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
@@ -136,6 +137,9 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         self._datapoint_nop = None
         self._isjammed = False
         self._remove_keepalive: CALLBACK_TYPE | None = None
+        # Cancels a pending self-heal that clears _commanded if the device
+        # never sends a state DP update after a command.
+        self._cmd_watchdog_unsub: CALLBACK_TYPE | None = None
         self._update_attrs()
 
     async def async_added_to_hass(self) -> None:
@@ -157,7 +161,36 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         if self._remove_keepalive is not None:
             self._remove_keepalive()
             self._remove_keepalive = None
+        self._cancel_cmd_watchdog()
         await super().async_will_remove_from_hass()
+
+    def _cancel_cmd_watchdog(self) -> None:
+        if self._cmd_watchdog_unsub is not None:
+            self._cmd_watchdog_unsub()
+            self._cmd_watchdog_unsub = None
+
+    @callback
+    def _async_cmd_watchdog(self, _now: datetime) -> None:
+        """Clear the in-flight flag if the device never reported new state.
+
+        Some firmware revisions of hc7n0urm acknowledge the V4 command but do
+        not push a follow-up DP 47 update. Without this watchdog, _commanded
+        would stay True forever and the dedupe path would block any further
+        lock/unlock commands from HA.
+        """
+        self._cmd_watchdog_unsub = None
+        if not self._commanded:
+            return
+        if self._current_state != self._target_state:
+            _LOGGER.warning(
+                "%s: %s command timed out without state update; marking jammed",
+                self._device.address,
+                self._target_state,
+            )
+            self._isjammed = True
+        self._commanded = False
+        self._update_attrs()
+        self.async_write_ha_state()
 
     @callback
     def _async_keepalive(self, _now: datetime) -> None:
@@ -204,7 +237,13 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         self._attr_is_locking = self.is_locking
         self._attr_is_unlocking = self.is_unlocking
         self._attr_is_locked = self.is_locked
-        self._attr_is_unlocked = not self.is_locked
+        # Until the first DP arrives we genuinely do not know the bolt state.
+        # `not None == True` would have lied that the lock is unlocked and let
+        # automations send a redundant lock command on every HA restart.
+        self._attr_is_unlocked = (
+            None if self._current_state == STATE_UNKNOWN
+            else self._current_state == STATE_UNLOCKED
+        )
         self._attr_is_jammed = self.is_jammed
         self._attr_changed_by = super().changed_by
 
@@ -216,8 +255,68 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         """Unlock the device."""
         await self._set_lock_state(STATE_UNLOCKED)
 
-    async def _set_lock_state(self, state: str) -> None:
+    async def async_force_unlock(self) -> None:
+        """Unlock even if HA already shows unlocked (sends BLE again, may beep)."""
+        await self._set_lock_state(STATE_UNLOCKED, force=True)
+
+    async def async_force_lock(self) -> None:
+        """Lock even if HA already shows locked (sends BLE again, may beep)."""
+        await self._set_lock_state(STATE_LOCKED, force=True)
+
+    async def _set_lock_state(self, state: str, *, force: bool = False) -> None:
+        # Self-heal a stale in-flight flag. If a previous command finished on
+        # the device but no DP update came back, _commanded would otherwise
+        # wedge the dedupe path below and the user could not issue any new
+        # command until the watchdog fires.
+        if (
+            self._commanded
+            and self._commanded_timer is not None
+            and datetime.now() > self._commanded_timer + timedelta(seconds=15)
+        ):
+            _LOGGER.warning(
+                "%s: previous %s command stale (no state update), resetting",
+                self._device.address,
+                self._target_state,
+            )
+            self._commanded = False
+            self._cancel_cmd_watchdog()
+            if self._current_state != self._target_state:
+                self._isjammed = True
+
+        # Skip a true no-op only when nothing is pending and there is no error.
+        # The lock beeps on every received ATT write, so re-sending lock when
+        # already locked is audible noise; but if a previous command has not
+        # completed, we must let this one through so the user is not stuck.
+        if (
+            not force
+            and self._current_state == state
+            and not self._isjammed
+            and not self._commanded
+        ):
+            _LOGGER.debug(
+                "%s: lock already %s, skip duplicate command",
+                self._device.address,
+                state,
+            )
+            return
+        if self._commanded and self._target_state == state:
+            _LOGGER.debug(
+                "%s: %s command already in flight, skip duplicate",
+                self._device.address,
+                state,
+            )
+            return
+
+        # Issuing a new command clears any prior jammed flag — we are about to
+        # find out the real outcome.
+        self._isjammed = False
         self._target_state = state
+        self._commanded = True
+        self._commanded_timer = datetime.now()
+        self._cancel_cmd_watchdog()
+        self._cmd_watchdog_unsub = async_call_later(
+            self.hass, 15, self._async_cmd_watchdog,
+        )
         self._update_attrs()
         self.async_write_ha_state()
 
@@ -232,10 +331,26 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
             False,
         )
 
-        #Gimdow need true to activate lock/unlock commands
-        self._hass.create_task(datapoint.set_value(True))
-        self._commanded = True
-        self._commanded_timer = datetime.now()
+        # Fire-and-forget keeps the HA service call snappy; the wrapper
+        # surfaces a hard failure as is_jammed instead of swallowing it
+        # silently in the BLE stack.
+        self._hass.async_create_task(self._execute_lock_command(datapoint, state))
+
+    async def _execute_lock_command(self, datapoint, state: str) -> None:
+        try:
+            await datapoint.set_value(True)
+        except Exception:
+            _LOGGER.exception(
+                "%s: %s command failed",
+                self._device.address,
+                state,
+            )
+            if self._commanded and self._target_state == state:
+                self._commanded = False
+                self._isjammed = True
+                self._cancel_cmd_watchdog()
+                self._update_attrs()
+                self.async_write_ha_state()
 
 
     def update_device_state(self):
@@ -250,9 +365,11 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
                     if ( datetime.now() > self._commanded_timer + timedelta(seconds = 12) ):
                         self._isjammed = True
                         self._commanded = False
+                        self._cancel_cmd_watchdog()
                 else:
                     self._commanded = False
                     self._isjammed = False
+                    self._cancel_cmd_watchdog()
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -293,3 +410,13 @@ async def async_setup_entry(
             )
     async_add_entities(entities)
 
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        SERVICE_FORCE_UNLOCK,
+        cv.make_entity_service_schema({}),
+        "async_force_unlock",
+    )
+    entity_platform.async_get_current_platform().async_register_entity_service(
+        SERVICE_FORCE_LOCK,
+        cv.make_entity_service_schema({}),
+        "async_force_lock",
+    )

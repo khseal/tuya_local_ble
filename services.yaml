@@ -1,0 +1,12 @@
+# Home Assistant: call with a target, e.g.
+# action: tuya_local_ble.force_lock
+# target:
+#   entity_id: lock.your_door
+force_lock:
+  target:
+    entity:
+      domain: lock
+force_unlock:
+  target:
+    entity:
+      domain: lock

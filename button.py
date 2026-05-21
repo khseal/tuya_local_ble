@@ -10,12 +10,15 @@ from homeassistant.components.button import (
     ButtonEntityDescription,
     ButtonEntity,
 )
+from homeassistant.components.lock import DOMAIN as LOCK_ENTITY_DOMAIN
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
-from .const import DOMAIN
+from .const import DOMAIN, SERVICE_FORCE_LOCK, SERVICE_FORCE_UNLOCK
 from .devices import TuyaBLEData, TuyaBLEEntity, TuyaBLEProductInfo
 from .tuya_ble import TuyaBLEDataPointType, TuyaBLEDevice
 
@@ -32,6 +35,8 @@ class TuyaBLEButtonMapping:
     force_add: bool = True
     dp_type: TuyaBLEDataPointType | None = None
     is_available: TuyaBLEButtonIsAvailable = None
+    #: When set, calls lock.force_lock / lock.force_unlock instead of a DP.
+    service_force: str | None = None
 
 
 def is_fingerbot_in_push_mode(self: TuyaBLEButton, product: TuyaBLEProductInfo) -> bool:
@@ -104,6 +109,34 @@ mapping: dict[str, TuyaBLECategoryButtonMapping] = {
             ),
         },
     ),
+    "jtmspro": TuyaBLECategoryButtonMapping(
+        products={
+            "hc7n0urm": [
+                TuyaBLEButtonMapping(
+                    dp_id=0,
+                    description=ButtonEntityDescription(
+                        key="force_lock",
+                        translation_key="force_lock",
+                        icon="mdi:lock-check",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    force_add=True,
+                    service_force=SERVICE_FORCE_LOCK,
+                ),
+                TuyaBLEButtonMapping(
+                    dp_id=0,
+                    description=ButtonEntityDescription(
+                        key="force_unlock",
+                        translation_key="force_unlock",
+                        icon="mdi:lock-open-check",
+                        entity_category=EntityCategory.CONFIG,
+                    ),
+                    force_add=True,
+                    service_force=SERVICE_FORCE_UNLOCK,
+                ),
+            ],
+        },
+    ),
     "znhsb": TuyaBLECategoryButtonMapping(
         products={
             "cdlandip":  # Smart water bottle
@@ -144,19 +177,60 @@ class TuyaBLEButton(TuyaBLEEntity, ButtonEntity):
         device: TuyaBLEDevice,
         product: TuyaBLEProductInfo,
         mapping: TuyaBLEButtonMapping,
+        config_entry_id: str | None = None,
     ) -> None:
         super().__init__(hass, coordinator, device, product, mapping.description)
         self._mapping = mapping
+        self._config_entry_id = config_entry_id
 
-    def press(self) -> None:
-        """Press the button."""
+    def _lock_entity_id_for_force(self) -> str | None:
+        if not self._config_entry_id:
+            return None
+        ent_reg = er.async_get(self.hass)
+        manual_uid = f"{self._device.device_id}-manual_lock"
+        for reg_entry in ent_reg.entities.values():
+            if reg_entry.config_entry_id != self._config_entry_id:
+                continue
+            if reg_entry.domain != LOCK_ENTITY_DOMAIN:
+                continue
+            if reg_entry.unique_id == manual_uid:
+                return reg_entry.entity_id
+        for reg_entry in ent_reg.entities.values():
+            if (
+                reg_entry.config_entry_id == self._config_entry_id
+                and reg_entry.domain == LOCK_ENTITY_DOMAIN
+            ):
+                return reg_entry.entity_id
+        return None
+
+    async def async_press(self) -> None:
+        """Handle the button press."""
+        if self._mapping.service_force:
+            lock_eid = self._lock_entity_id_for_force()
+            if not lock_eid:
+                _LOGGER.warning(
+                    "%s: no lock entity for force button (config %s)",
+                    self._device.address,
+                    self._config_entry_id,
+                )
+                return
+            # Use integration-domain services (registered in __init__.py).
+            # lock.force_* from async_register_entity_service is not always
+            # resolvable the same way across HA versions / reload races.
+            await self.hass.services.async_call(
+                DOMAIN,
+                self._mapping.service_force,
+                {"entity_id": lock_eid},
+                blocking=True,
+            )
+            return
         datapoint = self._device.datapoints.get_or_create(
             self._mapping.dp_id,
             TuyaBLEDataPointType.DT_BOOL,
             False,
         )
         if datapoint:
-            self._hass.create_task(datapoint.set_value(not bool(datapoint.value)))
+            await datapoint.set_value(not bool(datapoint.value))
 
     @property
     def available(self) -> bool:
@@ -176,9 +250,9 @@ async def async_setup_entry(
     data: TuyaBLEData = hass.data[DOMAIN][entry.entry_id]
     mappings = get_mapping_by_device(data.device)
     entities: list[TuyaBLEButton] = []
-    for mapping in mappings:
-        if mapping.force_add or data.device.datapoints.has_id(
-            mapping.dp_id, mapping.dp_type
+    for map_item in mappings:
+        if map_item.force_add or data.device.datapoints.has_id(
+            map_item.dp_id, map_item.dp_type
         ):
             entities.append(
                 TuyaBLEButton(
@@ -186,7 +260,10 @@ async def async_setup_entry(
                     data.coordinator,
                     data.device,
                     data.product,
-                    mapping,
+                    map_item,
+                    config_entry_id=entry.entry_id
+                    if map_item.service_force
+                    else None,
                 )
             )
     async_add_entities(entities)

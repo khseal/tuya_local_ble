@@ -3,14 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import logging
+
 from homeassistant.const import CONF_ADDRESS, CONF_DEVICE_ID
 
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.entity import (
     DeviceInfo,
     EntityDescription,
-    generate_entity_id,
 )
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import (
@@ -77,14 +77,63 @@ class TuyaBLEEntity(CoordinatorEntity):
         self._attr_has_entity_name = True
         self._attr_device_info = get_device_info(self._device)
         self._attr_unique_id = f"{self._device.device_id}-{description.key}"
-        self.entity_id = generate_entity_id(
-            "sensor.{}", self._attr_unique_id, hass=hass
-        )
+        # Do NOT pin entity_id with a hardcoded "sensor.{}" template here:
+        # it forced lock/select/switch/etc. entities into the wrong domain
+        # ("sensor.<id>_manual_lock" instead of "lock.<id>_manual_lock"),
+        # which Home Assistant will reject starting 2027.5.0.
+        # Existing registry entries keep their old IDs until renamed manually
+        # (Settings -> Entities -> entity -> Settings -> Entity ID).
 
     @property
     def available(self) -> bool:
         """Return if entity is available."""
         return self._coordinator.connected
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self._migrate_legacy_entity_id()
+
+    @callback
+    def _migrate_legacy_entity_id(self) -> None:
+        """Move legacy "sensor.<id>_<key>" entries onto the right platform.
+
+        Older versions of this integration pinned every entity_id to a
+        hardcoded "sensor.{}" template via generate_entity_id, regardless of
+        platform. From HA 2027.5 such mismatched entity_ids are rejected.
+        Rename them to the entity's actual platform domain so the warnings
+        go away and existing automations get updated by the registry.
+        """
+        if self.platform is None or self.entity_id is None:
+            return
+        target_domain = self.platform.domain
+        current_domain, _, object_id = self.entity_id.partition(".")
+        if not object_id or current_domain == target_domain:
+            return
+        if current_domain != "sensor":
+            # Don't touch entity_ids that the user already renamed manually.
+            return
+        ent_reg = er.async_get(self.hass)
+        new_entity_id = f"{target_domain}.{object_id}"
+        if ent_reg.async_get(new_entity_id) is not None:
+            _LOGGER.debug(
+                "Skip entity_id migration %s -> %s (target already exists)",
+                self.entity_id, new_entity_id,
+            )
+            return
+        try:
+            ent_reg.async_update_entity(
+                self.entity_id, new_entity_id=new_entity_id,
+            )
+        except (ValueError, KeyError) as err:
+            _LOGGER.warning(
+                "Could not migrate entity_id %s -> %s: %s",
+                self.entity_id, new_entity_id, err,
+            )
+            return
+        _LOGGER.info(
+            "Migrated legacy entity_id %s -> %s",
+            self.entity_id, new_entity_id,
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:

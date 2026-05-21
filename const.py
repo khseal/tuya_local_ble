@@ -36,3 +36,7 @@ FINGERBOT_MODE_SWITCH: Final = "switch"
 FINGERBOT_MODE_PROGRAM: Final = "program"
 FINGERBOT_BUTTON_EVENT: Final = "fingerbot_button_pressed"
 
+# Entity service on lock.* (registered in lock platform)
+SERVICE_FORCE_UNLOCK: Final = "force_unlock"
+SERVICE_FORCE_LOCK: Final = "force_lock"
+

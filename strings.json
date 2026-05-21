@@ -21,6 +21,12 @@
     "button": {
       "push": {
         "name": "Push"
+      },
+      "force_lock": {
+        "name": "Force lock"
+      },
+      "force_unlock": {
+        "name": "Force unlock"
       }
     },
     "number": {
@@ -206,6 +212,16 @@
       "program": {
         "name": "Program: position[/time];..."
       }
+    }
+  },
+  "services": {
+    "force_unlock": {
+      "name": "Force unlock",
+      "description": "Sends unlock over BLE even if the lock already shows unlocked (the lock may beep)."
+    },
+    "force_lock": {
+      "name": "Force lock",
+      "description": "Sends lock over BLE even if the lock already shows locked (the lock may beep)."
     }
   }
 }

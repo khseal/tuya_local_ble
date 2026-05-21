@@ -7,19 +7,26 @@ import logging
 from bleak_retry_connector import BLEAK_RETRY_EXCEPTIONS as BLEAK_EXCEPTIONS, get_device
 
 from homeassistant.components import bluetooth
+from homeassistant.components.lock import DOMAIN as LOCK_DOMAIN
 from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackMatcher
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.core import Event, HomeAssistant, ServiceCall, callback, split_entity_id
+from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.target import (
+    TargetSelection,
+    async_extract_referenced_entity_ids,
+)
 
 from .tuya_ble import TuyaBLEDevice
 
 from .keyman import HASSTuyaBLEDeviceManager
-from .const import DOMAIN
+from .const import DOMAIN, SERVICE_FORCE_LOCK, SERVICE_FORCE_UNLOCK
 from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
 
 PLATFORMS: list[Platform] = [
+    Platform.LOCK,
     Platform.BUTTON,
     Platform.CLIMATE,
     Platform.NUMBER,
@@ -28,10 +35,93 @@ PLATFORMS: list[Platform] = [
     Platform.SELECT,
     Platform.SWITCH,
     Platform.TEXT,
-    Platform.LOCK,
 ]
 
 _LOGGER = logging.getLogger(__name__)
+
+_FORCE_SERVICES_SCHEMA = cv.make_entity_service_schema({})
+
+
+async def _async_service_force_lock(hass: HomeAssistant, call: ServiceCall) -> None:
+    """tuya_local_ble.force_lock — same as lock.force_lock, with target support."""
+    selection = TargetSelection(call.data)
+    if not selection.has_any_target:
+        raise HomeAssistantError(
+            "Укажите цель действия: entity_id замка (или устройство/зона)."
+        )
+    referenced = async_extract_referenced_entity_ids(hass, selection, True)
+    entity_ids = referenced.referenced | referenced.indirectly_referenced
+    lock_comp = hass.data.get(LOCK_DOMAIN)
+    if lock_comp is None:
+        raise HomeAssistantError("Компонент lock не загружен.")
+    found = False
+    for eid in entity_ids:
+        if split_entity_id(eid)[0] != "lock":
+            continue
+        entity = lock_comp.get_entity(eid)
+        if entity is None or not hasattr(entity, "async_force_lock"):
+            continue
+        await entity.async_force_lock()
+        found = True
+    if not found:
+        raise HomeAssistantError(
+            "В цели нет замка Tuya Local BLE с поддержкой force_lock."
+        )
+
+
+async def _async_service_force_unlock(hass: HomeAssistant, call: ServiceCall) -> None:
+    """tuya_local_ble.force_unlock — same as lock.force_unlock, with target support."""
+    selection = TargetSelection(call.data)
+    if not selection.has_any_target:
+        raise HomeAssistantError(
+            "Укажите цель действия: entity_id замка (или устройство/зона)."
+        )
+    referenced = async_extract_referenced_entity_ids(hass, selection, True)
+    entity_ids = referenced.referenced | referenced.indirectly_referenced
+    lock_comp = hass.data.get(LOCK_DOMAIN)
+    if lock_comp is None:
+        raise HomeAssistantError("Компонент lock не загружен.")
+    found = False
+    for eid in entity_ids:
+        if split_entity_id(eid)[0] != "lock":
+            continue
+        entity = lock_comp.get_entity(eid)
+        if entity is None or not hasattr(entity, "async_force_unlock"):
+            continue
+        await entity.async_force_unlock()
+        found = True
+    if not found:
+        raise HomeAssistantError(
+            "В цели нет замка Tuya Local BLE с поддержкой force_unlock."
+        )
+
+
+def _ensure_domain_force_services(hass: HomeAssistant) -> None:
+    """Register tuya_local_ble.force_* once (parallel to lock.force_* entity services)."""
+    root = hass.data.setdefault(DOMAIN, {})
+    if root.get("_tuya_ble_force_services"):
+        return
+    root["_tuya_ble_force_services"] = True
+
+    async def _force_lock(call: ServiceCall) -> None:
+        await _async_service_force_lock(hass, call)
+
+    async def _force_unlock(call: ServiceCall) -> None:
+        await _async_service_force_unlock(hass, call)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_FORCE_LOCK,
+        _force_lock,
+        schema=_FORCE_SERVICES_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_FORCE_UNLOCK,
+        _force_unlock,
+        schema=_FORCE_SERVICES_SCHEMA,
+    )
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Tuya BLE from a config entry."""
@@ -104,6 +194,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    _ensure_domain_force_services(hass)
     #entry.async_on_unload(entry.add_update_listener(_async_update_listener))
 
     async def _async_stop(event: Event) -> None:
