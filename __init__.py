@@ -180,9 +180,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             task.result()
         except asyncio.CancelledError:
             pass
-        except Exception:
-            _LOGGER.debug("%s: initial device.update() failed", address, exc_info=True)
+        except Exception as ex:
+            _LOGGER.warning(
+                "%s: initial device.update() failed: %s",
+                address,
+                ex,
+                exc_info=True,
+            )
 
+    # Background connect + DEVICE_STATUS poll. Coordinator.connected stays False
+    # until this runs; skipping it left hc7 entities unavailable with no logs
+    # after "Initializing".
     t = hass.async_create_task(device.update())
     t.add_done_callback(_log_update_err)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = TuyaBLEData(

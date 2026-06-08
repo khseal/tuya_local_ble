@@ -50,9 +50,16 @@ HC7_PRODUCT_ID = "hc7n0urm"
 HC7_CONNECT_ATTEMPTS = 8
 HC7_NOTIFY_SETTLE_DELAY = 0.35
 HC7_NOTIFY_RETRY_DELAY = 0.8
-# Lock/unlock physically completes in ~3 s; do not block HA service call for the
-# generic 60 s while the future hangs (short DP_V4 events do not close it).
-HC7_COMMAND_RESPONSE_TIMEOUT = 10
+# ESP32 Bluetooth proxies add notify latency; allow a longer handshake window.
+HC7_HANDSHAKE_RESPONSE_TIMEOUT = 45
+# Pause after device-info before pair so session_key is stable through the proxy.
+HC7_HANDSHAKE_PAIR_DELAY = 0.75
+HC7_PAIR_ATTEMPTS = 3
+HC7_PAIR_RETRY_DELAY = 0.6
+# hc7n0urm can take 20+ s to ack V4 lock/unlock on a loaded BLE link.
+HC7_COMMAND_RESPONSE_TIMEOUT = 25
+HC7_PREPARE_SETTLE_DELAY = 0.3
+HC7_NOTIFY_DEDUPE_TTL = 60.0
 
 
 class TuyaBLEDataPoint:
@@ -257,6 +264,8 @@ class TuyaBLEDevice:
         # firmware revisions ack the V4 lock/unlock command but never push a
         # follow-up DP 47 update, leaving HA stuck in "unlocking…".
         self._hc7_reflect_task: asyncio.Task | None = None
+        # Drop identical GATT notify payloads (BlueZ/lock may replay them).
+        self._hc7_notify_dedupe: dict[str, float] = {}
 
         self._is_paired = False
 
@@ -509,6 +518,7 @@ class TuyaBLEDevice:
         # On the next session the lock has no memory of "prepared", so the next
         # unlock must re-send the prepare frame.
         self._hc7_unlock_prepared = False
+        self._hc7_notify_dedupe.clear()
         self._fire_disconnected_callbacks()
         if self._expected_disconnect:
             _LOGGER.debug(
@@ -749,6 +759,12 @@ class TuyaBLEDevice:
                     self._protocol_version = max(self._protocol_version, 4)
                     await asyncio.sleep(0.35)
 
+                handshake_timeout = (
+                    HC7_HANDSHAKE_RESPONSE_TIMEOUT
+                    if self.product_id == HC7_PRODUCT_ID
+                    else HANDSHAKE_RESPONSE_TIMEOUT
+                )
+
                 if self._client and self._client.is_connected:
                     _LOGGER.debug(
                         "%s: Sending device info request", self.address)
@@ -758,12 +774,13 @@ class TuyaBLEDevice:
                             b"\x00\xf3",
                             0,
                             True,
-                            HANDSHAKE_RESPONSE_TIMEOUT,
+                            handshake_timeout,
                         ):
                             self._client = None
                             _LOGGER.error(
-                                "%s: Sending device info request failed",
+                                "%s: Sending device info request failed (timeout after %ss)",
                                 self.address,
+                                handshake_timeout,
                             )
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
@@ -775,25 +792,62 @@ class TuyaBLEDevice:
                     continue
 
                 if self._client and self._client.is_connected:
-                    _LOGGER.debug("%s: Sending pairing request", self.address)
-                    try:
-                        if not await self._send_packet_while_connected(
-                            TuyaBLECode.FUN_SENDER_PAIR,
-                            self._build_pairing_request(),
-                            0,
-                            True,
-                            HANDSHAKE_RESPONSE_TIMEOUT,
-                        ):
+                    pair_attempts = (
+                        HC7_PAIR_ATTEMPTS
+                        if self.product_id == HC7_PRODUCT_ID
+                        else 1
+                    )
+                    paired = False
+                    for pair_try in range(pair_attempts):
+                        if pair_try > 0:
+                            self._clean_input()
+                            await asyncio.sleep(HC7_PAIR_RETRY_DELAY)
+                        elif self.product_id == HC7_PRODUCT_ID:
+                            await asyncio.sleep(HC7_HANDSHAKE_PAIR_DELAY)
+                        _LOGGER.debug(
+                            "%s: Sending pairing request (attempt %s/%s)",
+                            self.address,
+                            pair_try + 1,
+                            pair_attempts,
+                        )
+                        try:
+                            if await self._send_packet_while_connected(
+                                TuyaBLECode.FUN_SENDER_PAIR,
+                                self._build_pairing_request(),
+                                0,
+                                True,
+                                handshake_timeout,
+                            ):
+                                paired = True
+                                break
+                            _LOGGER.warning(
+                                "%s: Pairing attempt %s/%s timed out (no notify response)",
+                                self.address,
+                                pair_try + 1,
+                                pair_attempts,
+                            )
+                        except TuyaBLEDeviceError as err:
+                            _LOGGER.error(
+                                "%s: Pairing rejected by device (code %s)",
+                                self.address,
+                                err,
+                            )
+                            break
+                        except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
                             self._client = None
                             _LOGGER.error(
                                 "%s: Sending pairing request failed",
                                 self.address,
+                                exc_info=True,
                             )
-                            continue
-                    except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
+                            break
+                    if not paired:
                         self._client = None
-                        _LOGGER.error("%s: Sending pairing request failed",
-                                      self.address, exc_info=True)
+                        _LOGGER.error(
+                            "%s: Sending pairing request failed after %s attempt(s)",
+                            self.address,
+                            pair_attempts,
+                        )
                         continue
                 else:
                     continue
@@ -863,13 +917,40 @@ class TuyaBLEDevice:
             self.address,
             payload.hex(),
         )
+        # Prepare ack is optional for unlock; do not block 10–25 s on it.
         await self._send_packet(
             TuyaBLECode.FUN_SENDER_DPS_V4,
             bytes(payload),
-            True,
-            HC7_COMMAND_RESPONSE_TIMEOUT,
+            False,
         )
         self._hc7_unlock_prepared = True
+
+    async def _hc7_reset_after_command_timeout(self) -> None:
+        """Reset session state so the next command starts with seq 1."""
+        async with self._seq_num_lock:
+            if self._current_seq_num != 1:
+                _LOGGER.debug(
+                    "%s: resetting seq after command timeout (was %s)",
+                    self.address,
+                    self._current_seq_num,
+                )
+                self._current_seq_num = 1
+        self._hc7_unlock_prepared = False
+        self._hc7_notify_dedupe.clear()
+
+    def _hc7_is_duplicate_notify(self, data: bytearray) -> bool:
+        key = data.hex()
+        now = time.time()
+        seen_at = self._hc7_notify_dedupe.get(key)
+        if seen_at is not None and now - seen_at < HC7_NOTIFY_DEDUPE_TTL:
+            return True
+        self._hc7_notify_dedupe[key] = now
+        if len(self._hc7_notify_dedupe) > 200:
+            cutoff = now - HC7_NOTIFY_DEDUPE_TTL
+            self._hc7_notify_dedupe = {
+                k: v for k, v in self._hc7_notify_dedupe.items() if v >= cutoff
+            }
+        return False
 
     async def _hc7_unlock(self) -> None:
         """Send unlock command for hc7n0urm."""
@@ -877,7 +958,9 @@ class TuyaBLEDevice:
             _LOGGER.error("%s: Missing unlock_token for hc7n0urm", self.address)
             return
 
+        await self._ensure_connected()
         await self._hc7_prepare_unlock()
+        await asyncio.sleep(HC7_PREPARE_SETTLE_DELAY)
 
         token = self._unlock_token.encode("ascii")
         op_id = self._next_hc7_op_id()
@@ -1148,6 +1231,8 @@ class TuyaBLEDevice:
                     self.rssi,
                 )
                 result = False
+                if self.product_id == HC7_PRODUCT_ID:
+                    await self._hc7_reset_after_command_timeout()
             self._input_expected_responses.pop(seq_num, None)
 
         return result
@@ -1617,6 +1702,12 @@ class TuyaBLEDevice:
 
         if response_to != 0:
             future = self._input_expected_responses.pop(response_to, None)
+            if future is None and self.product_id == HC7_PRODUCT_ID:
+                _LOGGER.debug(
+                    "%s: ignoring late response to #%s (no waiter)",
+                    self.address,
+                    response_to,
+                )
             if future:
                 _LOGGER.debug(
                     "%s: Received expected response to #%s, result: %s",
@@ -1707,6 +1798,11 @@ class TuyaBLEDevice:
 
     def _notification_handler(self, _sender: int, data: bytearray) -> None:
         """Handle notification responses."""
+        if (
+            self.product_id == HC7_PRODUCT_ID
+            and self._hc7_is_duplicate_notify(data)
+        ):
+            return
         _LOGGER.debug("%s: Packet received: %s", self.address, data.hex())
 
         pos: int = 0
@@ -1751,7 +1847,20 @@ class TuyaBLEDevice:
             self._clean_input()
             return
         elif len(self._input_buffer) == self._input_expected_length:
-            self._parse_input()
+            try:
+                self._parse_input()
+            except (
+                TuyaBLEDataLengthError,
+                TuyaBLEDataCRCError,
+                TuyaBLEDataFormatError,
+            ):
+                _LOGGER.warning(
+                    "%s: Dropping corrupt notify frame (reassembled %s B); "
+                    "often caused by BLE proxy fragmentation or a stale session",
+                    self.address,
+                    self._input_expected_length,
+                    exc_info=True,
+                )
 
     async def _send_datapoints_v4(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device using V4 command 0x0027."""

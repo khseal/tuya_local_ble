@@ -314,8 +314,11 @@ class TuyaBLELock(TuyaBLEEntity, LockEntity):
         self._commanded = True
         self._commanded_timer = datetime.now()
         self._cancel_cmd_watchdog()
+        cmd_watchdog_sec = (
+            30 if self._device.product_id == "hc7n0urm" else 15
+        )
         self._cmd_watchdog_unsub = async_call_later(
-            self.hass, 15, self._async_cmd_watchdog,
+            self.hass, cmd_watchdog_sec, self._async_cmd_watchdog,
         )
         self._update_attrs()
         self.async_write_ha_state()
