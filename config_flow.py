@@ -26,7 +26,7 @@ from .tuya_ble import SERVICE_UUID, TuyaBLEDeviceCredentials
 from .const import (
     DOMAIN,
 )
-from .devices import TuyaBLEData, get_device_readable_name
+from .devices import get_device_readable_name, get_product_info_by_ids
 from .keyman import HASSTuyaBLEDeviceManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,6 +44,13 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
         self._data: dict[str, Any] = {}
         self._manager: HASSTuyaBLEDeviceManager | None = None
         self._get_device_info_error = False
+
+    @staticmethod
+    def _is_supported(credentials: TuyaBLEDeviceCredentials | None) -> bool:
+        return bool(
+            credentials
+            and get_product_info_by_ids(credentials.category, credentials.product_id)
+        )
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -72,7 +79,9 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
         await self._manager.async_load_devices_file()
         if self._manager.load_error == "invalid_json":
             return self.async_abort(reason="invalid_json")
-        #await self._manager.build_cache()
+        credentials = await self._manager.get_device_credentials(discovery_info.address)
+        if not self._is_supported(credentials):
+            return self.async_abort(reason="unsupported_device")
         self.context["title_placeholders"] = {
             "name": await get_device_readable_name(
                 discovery_info,
@@ -108,6 +117,8 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
             if credentials is None:
                 self._get_device_info_error = True
                 errors["base"] = "device_not_registered"
+            elif not self._is_supported(credentials):
+                errors["base"] = "unsupported_device"
             else:
                 return self.async_create_entry(
                     title=local_name,
@@ -124,10 +135,12 @@ class TuyaBLEConfigFlow(ConfigFlow, domain=DOMAIN):
                     discovery.address in current_addresses
                     or discovery.address in self._discovered_devices
                     or discovery.service_data is None
-                    or not SERVICE_UUID in discovery.service_data.keys()
+                    or SERVICE_UUID not in discovery.service_data
                 ):
                     continue
-                self._discovered_devices[discovery.address] = discovery
+                credentials = await self._manager.get_device_credentials(discovery.address)
+                if self._is_supported(credentials):
+                    self._discovered_devices[discovery.address] = discovery
 
         if not self._discovered_devices:
             return self.async_abort(reason="no_unconfigured_devices")

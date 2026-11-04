@@ -12,7 +12,7 @@ from homeassistant.components.bluetooth.match import ADDRESS, BluetoothCallbackM
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS, EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback, split_entity_id
-from homeassistant.exceptions import ConfigEntryNotReady, HomeAssistantError
+from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.target import (
     TargetSelection,
@@ -28,13 +28,7 @@ from .devices import TuyaBLECoordinator, TuyaBLEData, get_device_product_info
 PLATFORMS: list[Platform] = [
     Platform.LOCK,
     Platform.BUTTON,
-    Platform.CLIMATE,
-    Platform.NUMBER,
     Platform.SENSOR,
-    Platform.BINARY_SENSOR,
-    Platform.SELECT,
-    Platform.SWITCH,
-    Platform.TEXT,
 ]
 
 _LOGGER = logging.getLogger(__name__)
@@ -163,6 +157,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await device.initialize()
     product_info = get_device_product_info(device)
+    if product_info is None:
+        raise ConfigEntryError(
+            "Unsupported device: this integration supports only Raykube A1 Ultra (hc7n0urm)"
+        )
 
     coordinator = TuyaBLECoordinator(hass, device)
 
@@ -177,7 +175,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     def _log_update_err(task: asyncio.Task) -> None:
         try:
-            task.result()
+            if task.result() is False:
+                _LOGGER.warning("%s: initial device.update() was not confirmed", address)
         except asyncio.CancelledError:
             pass
         except Exception as ex:

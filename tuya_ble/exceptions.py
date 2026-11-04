@@ -37,4 +37,8 @@ class TuyaBLEDeviceError(TuyaBLEError):
     """Raised when Tuya BLE device returned error in response to command."""
 
     def __init__(self, code: int) -> None:
-        super().__init__(("BLE deice returned error code %s") % (code))
+        super().__init__(("BLE device returned error code %s") % (code))
+
+
+class TuyaBLECommandError(TuyaBLEError):
+    """Raised when a command could not be confirmed by the device."""

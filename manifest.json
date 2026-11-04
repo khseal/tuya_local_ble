@@ -1,6 +1,6 @@
 {
   "domain": "tuya_local_ble",
-  "name": "Tuya Local BLE",
+  "name": "Raykube A1 Ultra Local BLE",
   "bluetooth": [
     {
       "connectable": true,
@@ -14,5 +14,5 @@
   "integration_type": "device",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/khseal/tuya_local_ble/issues",
-  "version": "0.15"
+  "version": "0.15.5"
 }

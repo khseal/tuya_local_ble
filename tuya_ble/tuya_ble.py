@@ -33,6 +33,7 @@ from .const import (
     TuyaBLEDataPointType,
 )
 from .exceptions import (
+    TuyaBLECommandError,
     TuyaBLEDataCRCError,
     TuyaBLEDataFormatError,
     TuyaBLEDataLengthError,
@@ -239,6 +240,7 @@ class TuyaBLEDevice:
         self._operation_lock = asyncio.Lock()
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
+        self._reconnect_task: asyncio.Task | None = None
         self._expected_disconnect = False
         self._connected_callbacks: list[Callable[[], None]] = []
         self._callbacks: list[Callable[[list[TuyaBLEDataPoint]], None]] = []
@@ -260,12 +262,12 @@ class TuyaBLEDevice:
         self._session_key: bytes | None = None
         self._unlock_token: str = ""
         self._hc7_unlock_prepared = False
-        # Single-flight optimistic-state-reflection task for hc7n0urm: some
-        # firmware revisions ack the V4 lock/unlock command but never push a
-        # follow-up DP 47 update, leaving HA stuck in "unlocking…".
-        self._hc7_reflect_task: asyncio.Task | None = None
-        # Drop identical GATT notify payloads (BlueZ/lock may replay them).
-        self._hc7_notify_dedupe: dict[str, float] = {}
+        # Deduplicate fully decoded device requests by sequence number. Raw GATT
+        # fragments must never be dropped: every replay still needs an ACK.
+        self._hc7_received_requests: dict[tuple[int, int], float] = {}
+        # One best-effort ACK task per device request. A notification replay
+        # burst must not create an unbounded number of failing GATT writes.
+        self._pending_responses: set[tuple[int, int]] = set()
 
         self._is_paired = False
 
@@ -311,9 +313,16 @@ class TuyaBLEDevice:
             TuyaBLECode.FUN_SENDER_PAIR, self._build_pairing_request()
         )
 
-    async def update(self) -> None:
+    async def update(self) -> bool:
         _LOGGER.debug("%s: Updating", self.address)
-        await self._send_packet(TuyaBLECode.FUN_SENDER_DEVICE_STATUS, bytes())
+        timeout = (
+            HC7_COMMAND_RESPONSE_TIMEOUT
+            if self.product_id == HC7_PRODUCT_ID
+            else RESPONSE_WAIT_TIMEOUT
+        )
+        return await self._send_packet(
+            TuyaBLECode.FUN_SENDER_DEVICE_STATUS, bytes(), True, timeout
+        )
 
     async def _update_device_info(self) -> bool:
         if self._device_info is None:
@@ -439,6 +448,17 @@ class TuyaBLEDevice:
         return self._protocol_version_str
 
     @property
+    def firmware_version(self) -> str | None:
+        """Return a displayable version only after DEVICE_INFO arrives."""
+        if self._device_version and self._protocol_version_str:
+            return f"{self._device_version} (protocol {self._protocol_version_str})"
+        if self._device_version:
+            return self._device_version
+        if self._protocol_version_str:
+            return f"protocol {self._protocol_version_str}"
+        return None
+
+    @property
     def datapoints(self) -> TuyaBLEDataPoints:
         """Get datapoints exposed by device."""
         return self._datapoints
@@ -510,15 +530,26 @@ class TuyaBLEDevice:
         _LOGGER.debug("%s: Stop", self.address)
         await self._execute_disconnect()
 
+    def _fail_pending_responses(self, reason: str) -> None:
+        """Fail requests belonging to a closed BLE session."""
+        for seq_num, future in list(self._input_expected_responses.items()):
+            self._input_expected_responses.pop(seq_num, None)
+            if future is not None and not future.done():
+                future.set_exception(BleakError(reason))
+
     def _disconnected(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
+        # A delayed callback from an older client must not tear down a newly
+        # established session.
+        if self._client is not None and client is not self._client:
+            _LOGGER.debug("%s: Ignoring stale disconnect callback", self.address)
+            return
         was_paired = self._is_paired
         self._is_paired = False
-        # Vendor-specific unlock prepare state is bound to the BLE session.
-        # On the next session the lock has no memory of "prepared", so the next
-        # unlock must re-send the prepare frame.
         self._hc7_unlock_prepared = False
-        self._hc7_notify_dedupe.clear()
+        self._hc7_received_requests.clear()
+        self._clean_input()
+        self._fail_pending_responses("BLE device disconnected")
         self._fire_disconnected_callbacks()
         if self._expected_disconnect:
             _LOGGER.debug(
@@ -539,7 +570,7 @@ class TuyaBLEDevice:
                 self.address,
                 self.rssi,
             )
-            asyncio.create_task(self._reconnect())
+            self._schedule_reconnect()
 
     def _disconnect(self) -> None:
         """Disconnect from device."""
@@ -547,24 +578,19 @@ class TuyaBLEDevice:
 
     async def _execute_timed_disconnect(self) -> None:
         """Execute timed disconnection."""
-        _LOGGER.debug(
-            "%s: Disconnecting",
-            self.address,
-        )
+        _LOGGER.debug("%s: Disconnecting", self.address)
         await self._execute_disconnect()
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        if self._hc7_reflect_task is not None and not self._hc7_reflect_task.done():
-            self._hc7_reflect_task.cancel()
         async with self._connect_lock:
-            client = self._client
             self._expected_disconnect = True
-            self._client = None
-            if client and client.is_connected:
-                await client.stop_notify(CHARACTERISTIC_NOTIFY)
-                await client.disconnect()
+            await self._cleanup_failed_connection(self._client)
+        self._is_paired = False
         self._hc7_unlock_prepared = False
+        self._hc7_received_requests.clear()
+        self._clean_input()
+        self._fail_pending_responses("BLE integration stopped")
         async with self._seq_num_lock:
             self._current_seq_num = 1
 
@@ -574,6 +600,9 @@ class TuyaBLEDevice:
         """Close a failed BLE session without scheduling a reconnect task."""
         if self._client is client:
             self._client = None
+        self._is_paired = False
+        self._hc7_unlock_prepared = False
+        self._clean_input()
         if client is None:
             return
         expected_disconnect = self._expected_disconnect
@@ -596,7 +625,8 @@ class TuyaBLEDevice:
             await asyncio.sleep(HC7_NOTIFY_SETTLE_DELAY)
         try:
             await client.start_notify(
-                CHARACTERISTIC_NOTIFY, self._notification_handler
+                CHARACTERISTIC_NOTIFY,
+                lambda sender, data: self._notification_handler(sender, data, client),
             )
             return True
         except BleakDBusError as err:
@@ -620,7 +650,9 @@ class TuyaBLEDevice:
                 try:
                     await client.start_notify(
                         CHARACTERISTIC_NOTIFY,
-                        self._notification_handler,
+                        lambda sender, data: self._notification_handler(
+                            sender, data, client
+                        ),
                     )
                     return True
                 except BleakDBusError as err_re:
@@ -629,17 +661,17 @@ class TuyaBLEDevice:
                         ("notpermitted" in err_re_s and "acquired" in err_re_s)
                         or "notify acquired" in err_re_s
                     ):
-                        _LOGGER.debug(
-                            "%s: notify still acquired after stop; RSSI: %s",
+                        _LOGGER.warning(
+                            "%s: notify still acquired after stop; rebuilding BLE session; RSSI: %s",
                             self.address,
                             self.rssi,
                         )
-                        return True
-                    _LOGGER.debug(
-                        "%s: notify re-subscribe failed",
-                        self.address,
-                        exc_info=True,
-                    )
+                    else:
+                        _LOGGER.debug(
+                            "%s: notify re-subscribe failed",
+                            self.address,
+                            exc_info=True,
+                        )
                 except Exception:
                     _LOGGER.debug(
                         "%s: notify re-subscribe failed",
@@ -776,19 +808,20 @@ class TuyaBLEDevice:
                             True,
                             handshake_timeout,
                         ):
-                            self._client = None
                             _LOGGER.error(
                                 "%s: Sending device info request failed (timeout after %ss)",
                                 self.address,
                                 handshake_timeout,
                             )
+                            await self._cleanup_failed_connection(client)
                             continue
                     except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                        self._client = None
                         _LOGGER.error("%s: Sending device info request failed",
                                       self.address, exc_info=True)
+                        await self._cleanup_failed_connection(client)
                         continue
                 else:
+                    await self._cleanup_failed_connection(client)
                     continue
 
                 if self._client and self._client.is_connected:
@@ -834,7 +867,6 @@ class TuyaBLEDevice:
                             )
                             break
                         except:  # [BLEAK_EXCEPTIONS, BleakNotFoundError]:
-                            self._client = None
                             _LOGGER.error(
                                 "%s: Sending pairing request failed",
                                 self.address,
@@ -842,14 +874,15 @@ class TuyaBLEDevice:
                             )
                             break
                     if not paired:
-                        self._client = None
                         _LOGGER.error(
                             "%s: Sending pairing request failed after %s attempt(s)",
                             self.address,
                             pair_attempts,
                         )
+                        await self._cleanup_failed_connection(client)
                         continue
                 else:
+                    await self._cleanup_failed_connection(client)
                     continue
 
                 break
@@ -866,27 +899,41 @@ class TuyaBLEDevice:
         else:
             _LOGGER.error("%s: No client device", self.address)
 
+    def _schedule_reconnect(self) -> None:
+        """Run at most one reconnect loop at a time."""
+        if self._expected_disconnect:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        self._reconnect_task = asyncio.create_task(self._reconnect())
+
     async def _reconnect(self) -> None:
-        """Attempt a reconnect"""
-        _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
-        async with self._seq_num_lock:
-            self._current_seq_num = 1
-        try:
-            if self._expected_disconnect:
+        """Reconnect and restore state after an unexpected disconnect."""
+        while not self._expected_disconnect:
+            _LOGGER.debug("%s: Reconnect, ensuring connection", self.address)
+            try:
+                await self._ensure_connected()
+                if self._expected_disconnect:
+                    return
+                if not (
+                    self._client
+                    and self._client.is_connected
+                    and self._is_paired
+                ):
+                    raise BleakError("BLE reconnect finished without a paired session")
+                # Notifications emitted while disconnected are lost. A status
+                # request is therefore mandatory after every reconnect.
+                if not await self.update():
+                    raise BleakError("Status refresh after reconnect timed out")
+                _LOGGER.debug("%s: Reconnect and status refresh completed", self.address)
                 return
-            await self._ensure_connected()
-            if self._expected_disconnect:
-                return
-            _LOGGER.debug("%s: Reconnect, connection ensured", self.address)
-        except BLEAK_EXCEPTIONS:  # BleakNotFoundError:
-            _LOGGER.debug(
-                "%s: Reconnect, failed to ensure connection - backing off",
-                self.address,
-                exc_info=True,
-            )
-            await asyncio.sleep(BLEAK_BACKOFF_TIME)
-            _LOGGER.debug("%s: Reconnecting again", self.address)
-            asyncio.create_task(self._reconnect())
+            except BLEAK_EXCEPTIONS:
+                _LOGGER.debug(
+                    "%s: Reconnect failed; backing off",
+                    self.address,
+                    exc_info=True,
+                )
+                await asyncio.sleep(BLEAK_BACKOFF_TIME)
 
     def _next_hc7_op_id(self) -> int:
         """Operation id used in vendor-specific 0x0027 payloads."""
@@ -896,10 +943,8 @@ class TuyaBLEDevice:
         """Send unlock prepare frame for hc7n0urm."""
         if self._hc7_unlock_prepared:
             return
-
         if not self._unlock_token:
-            _LOGGER.error("%s: Missing unlock_token for hc7n0urm", self.address)
-            return
+            raise TuyaBLECommandError("Missing unlock_token for hc7n0urm")
 
         token = self._unlock_token.encode("ascii")
         op_id = self._next_hc7_op_id()
@@ -912,51 +957,50 @@ class TuyaBLEDevice:
         payload += token
         payload += b"\x00"
 
-        _LOGGER.debug(
-            "%s: Sending hc7n0urm unlock prepare payload: %s",
-            self.address,
-            payload.hex(),
-        )
+        # Do not log payload.hex(): it contains the unlock token.
+        _LOGGER.debug("%s: Sending hc7 unlock prepare, op_id=%s", self.address, op_id)
         # Prepare ack is optional for unlock; do not block 10–25 s on it.
-        await self._send_packet(
+        if not await self._send_packet(
             TuyaBLECode.FUN_SENDER_DPS_V4,
             bytes(payload),
             False,
-        )
+        ):
+            raise TuyaBLECommandError("Could not send hc7 unlock prepare")
         self._hc7_unlock_prepared = True
 
     async def _hc7_reset_after_command_timeout(self) -> None:
-        """Reset session state so the next command starts with seq 1."""
+        """Close a timed-out session so late responses cannot collide."""
+        if not self._is_paired:
+            # Pair retries still belong to the same handshake session.
+            self._clean_input()
+            return
+        _LOGGER.debug("%s: Rebuilding BLE session after command timeout", self.address)
+        await self._cleanup_failed_connection(self._client)
+        self._fail_pending_responses("BLE command timed out")
+        self._hc7_received_requests.clear()
         async with self._seq_num_lock:
-            if self._current_seq_num != 1:
-                _LOGGER.debug(
-                    "%s: resetting seq after command timeout (was %s)",
-                    self.address,
-                    self._current_seq_num,
-                )
-                self._current_seq_num = 1
-        self._hc7_unlock_prepared = False
-        self._hc7_notify_dedupe.clear()
+            self._current_seq_num = 1
+        self._schedule_reconnect()
 
-    def _hc7_is_duplicate_notify(self, data: bytearray) -> bool:
-        key = data.hex()
-        now = time.time()
-        seen_at = self._hc7_notify_dedupe.get(key)
+    def _hc7_is_duplicate_request(self, seq_num: int, code: TuyaBLECode) -> bool:
+        """Deduplicate decoded requests, never their transport fragments."""
+        key = (seq_num, code.value)
+        now = time.monotonic()
+        seen_at = self._hc7_received_requests.get(key)
         if seen_at is not None and now - seen_at < HC7_NOTIFY_DEDUPE_TTL:
             return True
-        self._hc7_notify_dedupe[key] = now
-        if len(self._hc7_notify_dedupe) > 200:
+        self._hc7_received_requests[key] = now
+        if len(self._hc7_received_requests) > 200:
             cutoff = now - HC7_NOTIFY_DEDUPE_TTL
-            self._hc7_notify_dedupe = {
-                k: v for k, v in self._hc7_notify_dedupe.items() if v >= cutoff
+            self._hc7_received_requests = {
+                k: v for k, v in self._hc7_received_requests.items() if v >= cutoff
             }
         return False
 
     async def _hc7_unlock(self) -> None:
         """Send unlock command for hc7n0urm."""
         if not self._unlock_token:
-            _LOGGER.error("%s: Missing unlock_token for hc7n0urm", self.address)
-            return
+            raise TuyaBLECommandError("Missing unlock_token for hc7n0urm")
 
         await self._ensure_connected()
         await self._hc7_prepare_unlock()
@@ -976,80 +1020,15 @@ class TuyaBLEDevice:
         payload += pack(">I", ts)
         payload += b"\x00\x01"
 
-        _LOGGER.debug(
-            "%s: Sending hc7n0urm unlock payload: %s",
-            self.address,
-            payload.hex(),
-        )
-        await self._send_packet(
+        # Do not log payload.hex(): it contains the unlock token.
+        _LOGGER.debug("%s: Sending hc7 unlock command, op_id=%s", self.address, op_id)
+        if not await self._send_packet(
             TuyaBLECode.FUN_SENDER_DPS_V4,
             bytes(payload),
             True,
             HC7_COMMAND_RESPONSE_TIMEOUT,
-        )
-
-    def _hc7_schedule_state_reflection(
-        self, unlocked: bool, reflect_since: float | None = None,
-    ) -> None:
-        """Cancel any pending reflection and arm a fresh one.
-
-        Some hc7n0urm firmware revisions only ack the V4 lock/unlock command
-        and never push the matching DP 47 update afterwards. Without a
-        fallback, HA stays in "locking/unlocking…" until the watchdog clears
-        it as jammed. This task waits a short grace window for a real DP
-        push and, if none arrives, synthesises a DP 47 update reflecting the
-        target state so the entity can settle.
-
-        reflect_since:
-            Wall time *before* the GATT command is sent. DP 47 may arrive
-            before this helper is scheduled (while awaiting _send_*). If we
-            only compared timestamps from "now" at schedule time, we would
-            false-negative and log a spurious warning even though the device
-            had already pushed bolt state.
-        """
-        if reflect_since is None:
-            reflect_since = time.time()
-        prev = self._hc7_reflect_task
-        if prev is not None and not prev.done():
-            prev.cancel()
-        self._hc7_reflect_task = asyncio.create_task(
-            self._hc7_reflect_state(unlocked, reflect_since)
-        )
-
-    async def _hc7_reflect_state(
-        self, unlocked: bool, reflect_since: float,
-    ) -> None:
-        # Wait long enough to absorb the genuine DP 47 push the firmware sends
-        # after a LOCK command (~3.5 s in btsnoop captures of A1 Ultra-JM).
-        # 5 s gives the firmware comfortable margin without making the UI feel
-        # frozen if it never pushes (UNLOCK case).
-        try:
-            await asyncio.sleep(5.0)
-        except asyncio.CancelledError:
-            return
-
-        dp47 = self._datapoints[47]
-        if dp47 is not None and isinstance(dp47.value, bool):
-            # Strongest signal: bolt state already matches (also fixes the
-            # race where DP 47 arrives before reflect_since is recorded).
-            if dp47.value == unlocked:
-                return
-        if dp47 is not None and dp47.timestamp >= reflect_since:
-            # New push since we started this command — trust it even if value
-            # parsing surprised us (unlikely).
-            return
-
-        # hc7n0urm: unlock usually does not push DP 47; lock normally does
-        # but we still synthesise when neither value nor timestamp caught it.
-        _LOGGER.debug(
-            "%s: synthesising DP 47=%s (no matching push after command)",
-            self.address,
-            "unlocked" if unlocked else "locked",
-        )
-        self._datapoints._update_from_device(
-            47, time.time(), 0, TuyaBLEDataPointType.DT_BOOL, unlocked,
-        )
-        self._fire_callbacks([self._datapoints[47]])
+        ):
+            raise TuyaBLECommandError("hc7 unlock was not acknowledged")
 
     @staticmethod
     def _calc_crc16(data: bytes) -> int:
@@ -1159,16 +1138,46 @@ class TuyaBLEDevice:
         wait_for_response: bool = True,
         response_timeout: float | None = None,
         # retry: int | None = None,
-    ) -> None:
-        """Send packet to device and optional read response."""
+    ) -> bool:
+        """Send a packet and report whether the operation was confirmed."""
         if self._expected_disconnect:
-            return
+            return False
         await self._ensure_connected()
-        if self._expected_disconnect:
-            return
-        await self._send_packet_while_connected(
+        if (
+            self._expected_disconnect
+            or not self._client
+            or not self._client.is_connected
+            or not self._is_paired
+        ):
+            return False
+        return await self._send_packet_while_connected(
             code, data, 0, wait_for_response, response_timeout
         )
+
+    def _schedule_response(
+        self,
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
+    ) -> None:
+        """Coalesce duplicate ACKs for a request already being answered."""
+        key = (response_to, code.value)
+        if key in self._pending_responses:
+            return
+        self._pending_responses.add(key)
+        asyncio.create_task(self._send_response_and_clear(key, code, data, response_to))
+
+    async def _send_response_and_clear(
+        self,
+        key: tuple[int, int],
+        code: TuyaBLECode,
+        data: bytes,
+        response_to: int,
+    ) -> None:
+        try:
+            await self._send_response(code, data, response_to)
+        finally:
+            self._pending_responses.discard(key)
 
     async def _send_response(
         self,
@@ -1176,9 +1185,26 @@ class TuyaBLEDevice:
         data: bytes,
         response_to: int,
     ) -> None:
-        """Send response to received packet."""
-        if self._client and self._client.is_connected:
+        """Send a best-effort ACK without leaking background task errors."""
+        client = self._client
+        if (
+            self._expected_disconnect
+            or client is None
+            or not client.is_connected
+            or self._client is not client
+        ):
+            return
+        try:
             await self._send_packet_while_connected(code, data, response_to, False)
+        except Exception:
+            # ACKs run in background tasks. A lost BLE session is recovered by
+            # the reconnect path; the device can replay its request afterwards.
+            _LOGGER.debug(
+                "%s: Could not acknowledge request #%s; BLE session unavailable",
+                self.address,
+                response_to,
+                exc_info=True,
+            )
 
     async def _send_packet_while_connected(
         self,
@@ -1212,9 +1238,14 @@ class TuyaBLEDevice:
                 seq_num,
                 code.name,
             )
-        packets: list[bytes] = self._build_packets(
-            seq_num, code, data, response_to)
-        await self._int_send_packet_while_connected(packets)
+        try:
+            packets: list[bytes] = self._build_packets(
+                seq_num, code, data, response_to
+            )
+            await self._int_send_packet_while_connected(packets)
+        except Exception:
+            self._input_expected_responses.pop(seq_num, None)
+            raise
         timeout_sec = (
             RESPONSE_WAIT_TIMEOUT if response_timeout is None else response_timeout
         )
@@ -1260,7 +1291,7 @@ class TuyaBLEDevice:
                 )
                 raise
             except BLEAK_EXCEPTIONS:
-                _LOGGER.error(
+                _LOGGER.debug(
                     "%s: communication failed",
                     self.address,
                     exc_info=True,
@@ -1294,11 +1325,11 @@ class TuyaBLEDevice:
             # command and trigger an audible ack on the lock without performing
             # the operation. Surface the error and let HA retry instead.
             if self.product_id == HC7_PRODUCT_ID:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             elif self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise BleakError from ex
         except BleakError as ex:
             # Disconnect so we can reset state and try again
@@ -1309,11 +1340,11 @@ class TuyaBLEDevice:
                 ex,
             )
             if self.product_id == HC7_PRODUCT_ID:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             elif self._is_paired:
                 asyncio.create_task(self._resend_packets(packets))
             else:
-                asyncio.create_task(self._reconnect())
+                self._schedule_reconnect()
             raise
 
     async def _int_send_packets_locked(self, packets: list[bytes]) -> None:
@@ -1327,22 +1358,18 @@ class TuyaBLEDevice:
                         packet,
                         False,
                     )
-                except:
-                    _LOGGER.error(
+                except Exception as err:
+                    _LOGGER.debug(
                         "%s: Error during sending packet",
                         self.address,
                         exc_info=True,
                     )
                     if self._client and self._client.is_connected:
                         self._disconnected(self._client)
-                    raise BleakError()
+                    raise BleakError("GATT write failed") from err
             else:
-                _LOGGER.error(
-                    "%s: Client disconnected during sending packet",
-                    self.address,
-                    exc_info=True,
-                )
-                raise BleakError()
+                _LOGGER.debug("%s: Client disconnected during sending packet", self.address)
+                raise BleakError("Client disconnected during sending packet")
 
     def _get_key(self, security_flag: int) -> bytes:
         if security_flag == 1:
@@ -1574,7 +1601,7 @@ class TuyaBLEDevice:
                 timestamp = int(time.time_ns() / 1000000)
                 timezone = -int(time.timezone / 36)
                 data = str(timestamp).encode() + pack(">h", timezone)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME2_REQ:
                 if len(data) != 0:
@@ -1593,27 +1620,25 @@ class TuyaBLEDevice:
                     time_str.tm_wday,
                     timezone,
                 )
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP:
                 self._parse_datapoints_v3(time.time(), 0, data, 0)
-                asyncio.create_task(
-                    self._send_response(code, bytes(0), seq_num))
+                self._schedule_response(code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_DP:
                 dp_seq_num = int.from_bytes(data[:2], "big")
                 flags = data[2]
                 self._parse_datapoints_v3(time.time(), flags, data, 2)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_TIME_DP:
                 timestamp: float
                 pos: int
                 timestamp, pos = self._parse_timestamp(data, 0)
                 self._parse_datapoints_v3(timestamp, 0, data, pos)
-                asyncio.create_task(
-                    self._send_response(code, bytes(0), seq_num))
+                self._schedule_response(code, bytes(0), seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_SIGN_TIME_DP:
                 timestamp: float
@@ -1623,7 +1648,7 @@ class TuyaBLEDevice:
                 timestamp, pos = self._parse_timestamp(data, 3)
                 self._parse_datapoints_v3(time.time(), flags, data, pos)
                 data = pack(">HBB", dp_seq_num, flags, 0)
-                asyncio.create_task(self._send_response(code, data, seq_num))
+                self._schedule_response(code, data, seq_num)
 
             case TuyaBLECode.FUN_RECEIVE_DP_V4:
                 _LOGGER.debug(
@@ -1631,6 +1656,16 @@ class TuyaBLEDevice:
                     self.address,
                     data.hex(),
                 )
+                if (
+                    response_to == 0
+                    and self.product_id == HC7_PRODUCT_ID
+                    and self._hc7_is_duplicate_request(seq_num, code)
+                ):
+                    # A replay may mean that our previous ACK was lost. ACK it
+                    # again, but do not apply the same datapoint update twice.
+                    _LOGGER.debug("%s: Re-acking duplicate DP_V4 #%s", self.address, seq_num)
+                    self._schedule_response(code, bytes(0), seq_num)
+                    return
 
                 try:
                     if self.product_id == "hc7n0urm":
@@ -1695,9 +1730,7 @@ class TuyaBLEDevice:
                 except Exception:
                     _LOGGER.exception("%s: DP_V4 parse failed", self.address)
 
-                asyncio.create_task(
-                    self._send_response(code, bytes(0), seq_num)
-                )
+                self._schedule_response(code, bytes(0), seq_num)
 
 
         if response_to != 0:
@@ -1796,12 +1829,15 @@ class TuyaBLEDevice:
 
         self._handle_command_or_response(seq_num, response_to, code, data)
 
-    def _notification_handler(self, _sender: int, data: bytearray) -> None:
-        """Handle notification responses."""
-        if (
-            self.product_id == HC7_PRODUCT_ID
-            and self._hc7_is_duplicate_notify(data)
-        ):
+    def _notification_handler(
+        self,
+        _sender: int,
+        data: bytearray,
+        client: BleakClientWithServiceCache | None = None,
+    ) -> None:
+        """Handle notification responses from the current BLE session only."""
+        if client is not None and self._client is not client:
+            _LOGGER.debug("%s: Ignoring notify from a stale BLE session", self.address)
             return
         _LOGGER.debug("%s: Packet received: %s", self.address, data.hex())
 
@@ -1897,36 +1933,31 @@ class TuyaBLEDevice:
             )
             return
 
-        await self._send_packet(
+        if not await self._send_packet(
             TuyaBLECode.FUN_SENDER_DPS_V4,
             data,
             True,
             HC7_COMMAND_RESPONSE_TIMEOUT,
-        )
+        ):
+            raise TuyaBLECommandError("hc7 lock was not acknowledged")
 
     async def _send_datapoints(self, datapoint_ids: list[int]) -> None:
         """Send new values of datapoints to the device."""
         if self.product_id == "hc7n0urm":
             if len(datapoint_ids) != 1:
-                _LOGGER.error("%s: hc7n0urm expects single datapoint command", self.address)
-                return
+                raise TuyaBLECommandError("hc7n0urm expects a single datapoint command")
 
             dp_id = datapoint_ids[0]
             dp = self._datapoints[dp_id]
 
-            # lock path
+            # State is changed only by a genuine DP 47 notification. An ACK or
+            # a timeout must never synthesise the physical bolt position.
             if dp_id == 46 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
-                reflect_since = time.time()
                 await self._send_datapoints_v4(datapoint_ids)
-                # If the device acks but does not push DP 47, synthesise it.
-                self._hc7_schedule_state_reflection(False, reflect_since)
                 return
 
-            # unlock path
             if dp_id == 6 and dp.type == TuyaBLEDataPointType.DT_BOOL and dp.value is True:
-                reflect_since = time.time()
                 await self._hc7_unlock()
-                self._hc7_schedule_state_reflection(True, reflect_since)
                 return
 
             _LOGGER.error(
